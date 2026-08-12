@@ -128,6 +128,19 @@ Item {
         Layout.alignment: Qt.AlignVCenter
         spacing: Theme.spacingLg + Theme.spacingXs
 
+        // Mask view replaces the picture with a black-and-white coverage map, which is
+        // disorienting if you have forgotten it is on. Shown only while active, so it doubles
+        // as the indicator and the way out.
+        ThemedToggleButton {
+            anchors.verticalCenter: parent.verticalCenter
+            visible: EditorState.maskViewClipId !== ""
+            text: qsTr("Cutout view")
+            checked: true
+            tooltip: qsTr("Showing what the cutouts cover. Exports are unaffected. Click to "
+                          + "go back to the picture.")
+            onClicked: EditorState.maskViewClipId = ""
+        }
+
         // Was plain clickable text that read as a label, with no hover,
         // no pressed state and no explanation of the two modes.
         ThemedToggleButton {

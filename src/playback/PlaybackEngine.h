@@ -84,6 +84,10 @@ public:
     // omitted from the composited frame so the QML inline editor stands in for it.
     void setEditingClipId(const QString &id);
 
+    // Id of the clip whose mask coverage the preview should show in place of the composite.
+    // Empty renders normally. Export is unaffected: it never reads this.
+    void setMaskViewClipId(const QString &id);
+
 signals:
     void currentFrameChanged();
     void playingChanged();
@@ -135,6 +139,7 @@ private:
     // seek that lands elsewhere while it renders must not be stepped over.
     drift::TimeUs m_qualityRequestUs = -1;
     QString m_editingClipId;
+    QString m_maskViewClipId;
     int m_previewRenderWidth = 0;
     int m_previewRenderHeight = 0;
     int m_sampleRate = 48000;
