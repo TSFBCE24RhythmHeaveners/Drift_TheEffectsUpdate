@@ -66,6 +66,7 @@
 #include <climits>
 #include <cmath>
 #include <optional>
+#include <utility>
 
 namespace {
 QHash<QString, QString> defaultShortcuts();
@@ -246,6 +247,14 @@ AppController::AppController(AssetLibrary *assetLibrary, QObject *parent)
     const QVariant storedDarkMode = settings.value(QStringLiteral("ui/darkMode"));
     m_darkModeOverridden = storedDarkMode.isValid();
     m_darkModePreferred = storedDarkMode.toBool();
+    // Likewise unset means the workspace still follows the canvas orientation.
+    const QVariant storedWorkspace = settings.value(QStringLiteral("ui/workspaceLayout"));
+    m_workspaceLayoutOverridden = storedWorkspace.isValid();
+    if (m_workspaceLayoutOverridden) {
+        m_workspaceLayoutPreferred = storedWorkspace.toString() == QStringLiteral("portrait")
+            ? QStringLiteral("portrait")
+            : QStringLiteral("landscape");
+    }
     loadAssetFavorites();
 
     // Periodically snapshot unsaved work to a recovery file so a crash doesn't
@@ -1882,6 +1891,30 @@ void AppController::setDarkModePreference(bool enabled)
     QSettings settings;
     settings.setValue(QStringLiteral("ui/darkMode"), m_darkModePreferred);
     emit darkModePreferenceChanged();
+}
+
+void AppController::setWorkspaceLayoutPreference(const QString &layout)
+{
+    const QString normalized = layout == QStringLiteral("portrait")
+        ? QStringLiteral("portrait")
+        : QStringLiteral("landscape");
+    if (m_workspaceLayoutOverridden && m_workspaceLayoutPreferred == normalized)
+        return;
+    m_workspaceLayoutOverridden = true;
+    m_workspaceLayoutPreferred = normalized;
+    QSettings settings;
+    settings.setValue(QStringLiteral("ui/workspaceLayout"), m_workspaceLayoutPreferred);
+    emit workspaceLayoutPreferenceChanged();
+}
+
+void AppController::clearWorkspaceLayoutPreference()
+{
+    if (!m_workspaceLayoutOverridden)
+        return;
+    m_workspaceLayoutOverridden = false;
+    QSettings settings;
+    settings.remove(QStringLiteral("ui/workspaceLayout"));
+    emit workspaceLayoutPreferenceChanged();
 }
 
 void AppController::setMediaGridMode(bool enabled)
@@ -5305,12 +5338,20 @@ void AppController::setProjectSetup(int width, int height, int fps)
     if (m_project.width() == width && m_project.height() == height && m_project.fps() == fps)
         return;
 
+    // Answering the first-run layout chooser is not an edit — it is the project taking its initial
+    // shape. Pushing an undo command here is what used to leave a brand-new project dirty with one
+    // entry on a freshly cleared stack. ProjectSetupDialog runs after the first clip was added, so
+    // the stack is non-empty by then and it still gets its undo step.
+    const bool pristine =
+        m_undoStack.count() == 0 && !m_dirty && m_currentProjectPath.isEmpty();
+
     const drift::Project before = m_project;
     if (m_project.width() != width || m_project.height() != height)
         drift::rebaseClipLayout(m_project, m_project.width(), m_project.height(), 0.0, 0.0);
     m_project.setResolution(width, height);
     m_project.setFps(fps);
-    pushProjectEdit(before, QStringLiteral("Project setup"));
+    if (!pristine)
+        pushProjectEdit(before, QStringLiteral("Project setup"));
     finishEdit(QStringLiteral("Project setup updated"));
 }
 
@@ -9893,6 +9934,35 @@ QByteArray AppController::serializeProjectJson() const
     return QJsonDocument(root).toJson(QJsonDocument::Indented);
 }
 
+void AppController::resetSessionState()
+{
+    // These end up editing the project, so they have to run while it is still the one they were
+    // opened against.
+    endSpeedCurveSession();
+    endFadeCurveSession();
+    endSegmentationSession();
+
+    m_clipboard.clear();
+    // Keyed by timeline position rather than by source, so entries from the old project would be
+    // served for the same span in the new one.
+    m_subtitleWaveformCache.clear();
+    m_subtitleWaveformPending.clear();
+    // Beats are timeline-absolute for the same reason.
+    clearBeatAnalysis();
+    // Also drops the failed-source blacklist, so media that was missing gets another chance.
+    m_filmstripTiles.clear();
+
+    m_replacingAssetId.clear();
+    m_pendingEffectTemplate.reset();
+    m_previewDragActive = false;
+    m_keyframeGraphHiddenProperties.clear();
+    setCanvasCropMode(false);
+    setSubtitleEditing(false);
+    setSelectedSubtitleCue(-1);
+
+    emit projectReset();
+}
+
 bool AppController::applyProjectJson(const QByteArray &data, QString *error)
 {
     const QJsonDocument document = QJsonDocument::fromJson(data);
@@ -9903,8 +9973,19 @@ bool AppController::applyProjectJson(const QByteArray &data, QString *error)
     }
 
     const QJsonObject root = document.object();
+
+    // Parse into a local and check before touching anything: a project we end up rejecting must
+    // leave the open one exactly as it was, session state included.
     QString parseError;
-    m_project = drift::Project::fromJson(root, &parseError);
+    drift::Project parsed = drift::Project::fromJson(root, &parseError);
+    if (!parseError.isEmpty()) {
+        if (error)
+            *error = parseError;
+        return false;
+    }
+
+    resetSessionState();
+    m_project = std::move(parsed);
 
     // Stickers moved out of the QRC and into an addon, so projects saved before that store paths
     // like ":/qt/qml/Drift/resources/stickers/grinning.png" that no longer resolve. Repoint them
@@ -10249,10 +10330,13 @@ void AppController::remapProjectPaths(const QHash<QString, QString> &remap)
 void AppController::newProject()
 {
     setPlaying(false);
-    m_project.resetToDefaultTimeline();
+    resetSessionState();
+    // Whole-document replacement rather than resetToDefaultTimeline(), which only clears the
+    // tracks — the asset pool, name, canvas size, bookmarks, work area and background all used to
+    // survive into the "new" project.
+    m_project = drift::Project{};
     m_project.setAuthor(QSettings().value(QStringLiteral("authorName")).toString());
     m_embeddedSources.clear();
-    m_filmstripTiles.clear();
     if (m_assetLibrary)
         m_assetLibrary->setProject(&m_project);
     m_playback.setProject(&m_project);
@@ -10260,6 +10344,12 @@ void AppController::newProject()
     clearSelection();
     setPlayheadUs(0);
     setCurrentProjectPath(QString());
+    // Per-project editor prefs: these travel in the project file, so they belong to the document
+    // that was just discarded. Same defaults applyProjectJson falls back to.
+    m_snapEnabled = true;
+    m_rippleEnabled = false;
+    m_allowClipOverlap = false;
+    setLoopWorkAreaEnabled(false);
     setMediaGridMode(true);
     setDirty(false);
     deleteRecoveryFile();
