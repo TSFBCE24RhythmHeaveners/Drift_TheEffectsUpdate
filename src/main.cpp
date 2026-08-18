@@ -2,6 +2,7 @@
 #include "engine/EmojiCatalog.h"
 #include "engine/FontCatalog.h"
 #include "engine/ReverseProxyCache.h"
+#include "mcp/McpStdio.h"
 #include "models/AddonManager.h"
 #include "models/AppController.h"
 #include "models/AssetLibrary.h"
@@ -17,9 +18,11 @@
 // QApplication (not QGuiApplication) is required so QFileDialog can use the
 // native platform file picker, which routes through xdg-desktop-portal.
 #include <QApplication>
+#include <QCoreApplication>
 #include <QIcon>
 #include <QLoggingCategory>
 #include <QQmlApplicationEngine>
+#include <QQmlEngine>
 #include <QQuickWindow>
 #include <QSurfaceFormat>
 #include <QtQml/qqml.h>
@@ -62,6 +65,15 @@ int main(int argc, char *argv[])
 {
     applyLogLevel(verboseLoggingRequested(argc, argv));
 
+    for (int i = 1; i < argc; ++i) {
+        if (qstrcmp(argv[i], "--mcp-stdio") == 0) {
+            QCoreApplication app(argc, argv);
+            QCoreApplication::setApplicationName("CutWire Drift");
+            QCoreApplication::setOrganizationName("CutWire Drift");
+            return drift::mcp::runStdioAttach();
+        }
+    }
+
 #ifdef Q_OS_MACOS
     // NSOpenGLContext will not share between the legacy 2.1 context Qt defaults to and the 3.3
     // core one GlRuntime creates, and drops the share with only a warning, leaving the preview
@@ -89,6 +101,10 @@ int main(int argc, char *argv[])
     // Linux runs from the build tree). The .exe still needs the Windows .rc icon
     // for Explorer and pinned-taskbar identity.
     QApplication::setWindowIcon(QIcon(QStringLiteral(":/app/drift.png")));
+
+    // qsTr/tr resolve when the QML engine loads, so translators must be installed first.
+    // Protocol strings under src/mcp/ are excluded from the catalog; they stay English.
+    AppController::installUiTranslators();
 
     // Registering the bundled fonts needs a QGuiApplication, and must happen before the compositor
     // thread starts touching QFontDatabase.
@@ -119,6 +135,8 @@ int main(int argc, char *argv[])
     qmlRegisterSingletonInstance("Drift", 1, 0, "Updates", &updateChecker);
 
     QQmlApplicationEngine engine;
+    QObject::connect(&editorState, &AppController::uiLanguageChanged,
+                     &engine, &QQmlEngine::retranslate);
     engine.addImageProvider(QStringLiteral("drift"), new DriftImageProvider());
     engine.addImageProvider(QStringLiteral("segment"), new SegmentImageProvider());
     engine.addImageProvider(QStringLiteral("clippreview"), new ClipPreviewImageProvider());

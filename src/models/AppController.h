@@ -14,6 +14,7 @@
 
 #include <QAtomicInt>
 #include <QHash>
+#include <QJsonObject>
 #include <QObject>
 #include <QPair>
 #include <QSet>
@@ -22,11 +23,16 @@
 #include <QVariantList>
 #include <QVariantMap>
 
+#include <memory>
 #include <optional>
 
 struct EffectTemplateEntry;
 
 class QTimer;
+
+namespace drift::mcp {
+class McpServer;
+}
 
 #include "playback/ClipPreviewPlayer.h"
 #include "playback/PlaybackEngine.h"
@@ -69,6 +75,20 @@ class AppController : public QObject
     Q_PROPERTY(bool autoKeyEnabled READ autoKeyEnabled WRITE setAutoKeyEnabled NOTIFY autoKeyEnabledChanged)
     // Opt-in: on launch, restore the last open project (saved .drift or unsaved recovery snapshot).
     Q_PROPERTY(bool reopenLastProject READ reopenLastProject WRITE setReopenLastProject NOTIFY reopenLastProjectChanged)
+    // Session-only localhost MCP for agents. Never persisted. Off at every launch.
+    Q_PROPERTY(bool mcpEnabled READ mcpEnabled WRITE setMcpEnabled NOTIFY mcpRunningChanged)
+    Q_PROPERTY(bool mcpRunning READ mcpRunning NOTIFY mcpRunningChanged)
+    Q_PROPERTY(QString mcpUrl READ mcpUrl NOTIFY mcpRunningChanged)
+    Q_PROPERTY(QString mcpToken READ mcpToken NOTIFY mcpRunningChanged)
+    Q_PROPERTY(int mcpPort READ mcpPort NOTIFY mcpRunningChanged)
+    Q_PROPERTY(QString mcpError READ mcpError NOTIFY mcpErrorChanged)
+    Q_PROPERTY(QString mcpCursorSnippet READ mcpCursorSnippet NOTIFY mcpRunningChanged)
+    Q_PROPERTY(QString mcpClaudeCommand READ mcpClaudeCommand NOTIFY mcpRunningChanged)
+    Q_PROPERTY(QString mcpStdioSnippet READ mcpStdioSnippet NOTIFY mcpRunningChanged)
+    // App-wide interface language, QSettings("ui/language"). Empty means follow the OS locale.
+    // "en" is the source catalog (no .qm). Other codes match i18n/drift_<code>.qm.
+    Q_PROPERTY(QString uiLanguage READ uiLanguage WRITE setUiLanguage NOTIFY uiLanguageChanged)
+    Q_PROPERTY(QVariantList uiLanguages READ uiLanguages NOTIFY uiLanguageChanged)
     // The keyframe strip draws every animated property of the selected clip. This is the subset
     // the user has folded away: a view filter only — hiding a curve never changes what renders.
     Q_PROPERTY(QStringList keyframeGraphHiddenProperties READ keyframeGraphHiddenProperties
@@ -211,6 +231,11 @@ public:
     bool mediaGridMode() const { return m_mediaGridMode; }
     bool autoKeyEnabled() const { return m_autoKeyEnabled; }
     bool reopenLastProject() const { return m_reopenLastProject; }
+    QString uiLanguage() const { return m_uiLanguage; }
+    QVariantList uiLanguages() const;
+    // Installs the .qm for ui/language (or the system locale). Call once after QApplication
+    // is named, and again from setUiLanguage. Safe before any AppController exists.
+    static void installUiTranslators();
     QStringList keyframeGraphHiddenProperties() const { return m_keyframeGraphHiddenProperties; }
     bool subtitleEditing() const { return m_subtitleEditing; }
     int selectedSubtitleCue() const { return m_selectedSubtitleCue; }
@@ -276,9 +301,58 @@ public:
     void setRippleEnabled(bool enabled);
     void setAllowClipOverlap(bool enabled);
     Q_INVOKABLE void setDarkModePreference(bool enabled);
+    Q_INVOKABLE void clearDarkModePreference();
     void setMediaGridMode(bool enabled);
     void setAutoKeyEnabled(bool enabled);
     void setReopenLastProject(bool enabled);
+    Q_INVOKABLE void setMcpEnabled(bool enabled);
+    bool mcpEnabled() const { return mcpRunning(); }
+    bool mcpRunning() const;
+    QString mcpUrl() const;
+    QString mcpToken() const;
+    int mcpPort() const;
+    QString mcpError() const;
+    QString mcpCursorSnippet() const;
+    QString mcpClaudeCommand() const;
+    QString mcpStdioSnippet() const;
+    Q_INVOKABLE void copyMcpCursorSnippet();
+    Q_INVOKABLE void copyMcpClaudeCommand();
+    Q_INVOKABLE void copyMcpStdioSnippet();
+    Q_INVOKABLE void copyMcpAgentGuide();
+    QString mcpAgentGuide() const;
+
+    // MCP helpers (GUI thread). Used by src/mcp, not QML.
+    QPair<int, int> mcpLocateClip(const QString &id) const;
+    QString mcpClipId(int trackIndex, int clipIndex) const;
+    QVariantMap mcpCompactClip(int trackIndex, int clipIndex, bool includeCanvas = true) const;
+    QJsonObject mcpInspect(bool includeClips, int sinceRevision = -1, bool detail = false) const;
+    int mcpRevision() const { return m_mcpEditRevision; }
+    bool mcpSetClipCanvas(int trackIndex, int clipIndex, const QVariantMap &patch);
+    QJsonObject mcpCaptureFrame(double atSeconds, bool full);
+    bool mcpSetWorkArea(double inSeconds, double outSeconds);
+
+    // Audio for agents. All of these block: the QML-facing waveform getters return empty on the
+    // first call and repaint on a signal, which works for a binding and not at all for a caller
+    // that gets one reply. These decode/mix inline instead, on the mcpCaptureFrame pattern.
+    QJsonObject mcpWaveformForClip(int trackIndex, int clipIndex, int buckets) const;
+    QJsonObject mcpWaveformForAsset(const QString &assetId, double startSeconds,
+                                    double durSeconds, int buckets) const;
+    QJsonObject mcpWaveformForTimeline(double startSeconds, double durSeconds, int buckets) const;
+    QJsonObject mcpDetectBeats(double startSeconds, double durSeconds, bool force);
+    QJsonObject mcpBeatPayload() const;
+    QJsonObject mcpAudioSummary() const;
+    // Grid times from the current analysis. `unit` is beat, bar or onset; `minStrength` filters
+    // onsets only. Empty when nothing has been analysed yet.
+    QList<double> mcpBeatTimes(const QString &unit, double minStrength) const;
+    int mcpBookmarkBeats(double startSeconds, double durSeconds, const QString &unit,
+                         double minStrength, const QString &labelPrefix);
+    QJsonObject mcpSetBeatLayers(bool grid, bool onsets);
+    QJsonObject mcpSetClipVolume(int trackIndex, int clipIndex, double value, bool atGiven,
+                                 double atSeconds);
+    void mcpRememberExportSettings(const QVariantMap &settings);
+    void mcpBeginBatch();
+    void mcpEndBatch(const QString &text, bool pushUndo);
+    void setUiLanguage(const QString &code);
     // Strip chip click — folds `prop`'s curve away, or brings it back. Purely a view filter: the
     // chip stays put either way, and the animation keeps playing while it is hidden.
     Q_INVOKABLE void toggleKeyframeGraphPropertyVisible(const QString &prop);
@@ -414,7 +488,7 @@ public:
     // SVG "d" string for the assets-panel thumbnail, on the 0..100 grid ShapePreview.qml uses.
     Q_INVOKABLE QString shapeSvgPath(const QString &shapeId) const;
     Q_INVOKABLE QVariantList previewClipsAtPlayhead() const;
-    Q_INVOKABLE void beginPreviewDrag(const QString &undoText = QStringLiteral("Edit clip"));
+    Q_INVOKABLE void beginPreviewDrag(const QString &undoText = {});
     Q_INVOKABLE void previewSetClipPosition(int trackIndex, int clipIndex, double xPixels, double yPixels);
     Q_INVOKABLE void previewSetClipSize(int trackIndex, int clipIndex, double widthPixels, double heightPixels);
     Q_INVOKABLE void previewSetClipRect(int trackIndex, int clipIndex, double xPixels, double yPixels,
@@ -756,6 +830,9 @@ signals:
     void mediaGridModeChanged();
     void autoKeyEnabledChanged();
     void reopenLastProjectChanged();
+    void mcpRunningChanged();
+    void mcpErrorChanged();
+    void uiLanguageChanged();
     void keyframeGraphVisibilityChanged();
     void subtitleEditingChanged();
     void selectedSubtitleCueChanged();
@@ -932,6 +1009,7 @@ protected:
     drift::bundle::WriteRequest buildWriteRequest(bool embedSource) const;
     void rememberEmbeddedSources(const QList<drift::bundle::MediaEntry> &media);
     // Persist the save-picker folder and encode/scale choices for the next Export dialog.
+    // Empty `outputPath` updates settings only and leaves lastExportFolder unchanged.
     void rememberExportChoice(const QString &outputPath, const QVariantMap &settings);
     // Repoint every path field the extraction moved. Clips duplicate their asset's path, so this
     // matches on the value rather than walking by id.
@@ -973,6 +1051,7 @@ protected:
     bool m_mediaGridMode = true;
     bool m_autoKeyEnabled = false;
     bool m_reopenLastProject = false;
+    QString m_uiLanguage;
     QStringList m_keyframeGraphHiddenProperties;
     bool m_subtitleEditing = false;
     int m_selectedSubtitleCue = -1;
@@ -1065,7 +1144,7 @@ protected:
     bool m_inlineTextEditing = false;
     bool m_previewDragActive = false;
     drift::Project m_previewDragBefore;
-    QString m_previewDragText = QStringLiteral("Edit clip");
+    QString m_previewDragText;
     void emitPreviewFrame();
     void syncTextOverlaySkip();
     struct ClipboardItem
@@ -1118,6 +1197,15 @@ protected:
     QVariantMap m_recoveryInfo;
     // Launch layout picker / first-clip setup completed for this empty project.
     bool m_projectLayoutChosen = false;
+
+    std::unique_ptr<drift::mcp::McpServer> m_mcp;
+    bool m_mcpUndoSuspended = false;
+    int m_mcpBatchDepth = 0;
+    drift::Project m_mcpBatchBefore;
+    int m_mcpEditRevision = 0;
+    mutable QHash<QString, QPair<int, int>> m_mcpClipIndex;
+    mutable int m_mcpClipIndexRevision = -1;
+    void rebuildMcpClipIndexIfNeeded() const;
 
     void setProjectLayoutChosen(bool chosen);
 

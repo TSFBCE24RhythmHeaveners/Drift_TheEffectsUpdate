@@ -36,13 +36,19 @@
 #include "SegmentImageStore.h"
 #include "engine/TransitionCatalog.h"
 #include "engine/WhisperTranscriber.h"
+#include "mcp/McpCatalog.h"
+#include "mcp/McpJson.h"
+#include "mcp/McpServer.h"
 
+#include <QBuffer>
+#include <QClipboard>
 #include <QColor>
 #include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QCursor>
 #include <QDateTime>
 #include <QDir>
+#include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
 #include <QGuiApplication>
@@ -52,7 +58,10 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPixmap>
+#include <QLibraryInfo>
+#include <QLocale>
 #include <QSettings>
+#include <QTranslator>
 #include <QSet>
 #include <QStandardPaths>
 #include <QTimer>
@@ -70,6 +79,34 @@
 
 namespace {
 QHash<QString, QString> defaultShortcuts();
+
+QTranslator g_appTranslator;
+QTranslator g_qtTranslator;
+
+QString storedUiLanguage()
+{
+    return QSettings().value(QStringLiteral("ui/language")).toString().trimmed();
+}
+
+QLocale uiLocaleFromStored()
+{
+    const QString code = storedUiLanguage();
+    return code.isEmpty() ? QLocale::system() : QLocale(code);
+}
+
+QString languageLabel(const QString &code)
+{
+    const QLocale loc(code);
+    QString native = loc.nativeLanguageName();
+    if (native.isEmpty())
+        return code;
+    if (code.contains(QLatin1Char('_')) || code.contains(QLatin1Char('-'))) {
+        const QString territory = loc.nativeTerritoryName();
+        if (!territory.isEmpty())
+            native += QStringLiteral(" (%1)").arg(territory);
+    }
+    return native;
+}
 
 QCursor timelineTrimCursor(int side, int heightPx)
 {
@@ -119,6 +156,8 @@ QCursor timelineTrimCursor(int side, int heightPx)
 
 AppController::~AppController()
 {
+    if (m_mcp)
+        m_mcp->stop();
     // ~QUndoStack clears the stack, which emits indexChanged into the lambda
     // below — but by then the members it touches (m_selection, the models) are
     // already gone. Cut the signals before any member is destroyed.
@@ -166,6 +205,11 @@ AppController::AppController(AssetLibrary *assetLibrary, QObject *parent)
     }
 
     m_undoStack.setUndoLimit(kMaxUndoSteps);
+
+    m_mcp = std::make_unique<drift::mcp::McpServer>(this);
+    connect(m_mcp.get(), &drift::mcp::McpServer::runningChanged, this,
+            &AppController::mcpRunningChanged);
+    connect(m_mcp.get(), &drift::mcp::McpServer::errorChanged, this, &AppController::mcpErrorChanged);
     connect(&m_undoStack, &QUndoStack::indexChanged, this, &AppController::undoStackChanged);
     connect(&m_undoStack, &QUndoStack::indexChanged, this, [this] {
         m_timelineModel.refresh();
@@ -243,6 +287,7 @@ AppController::AppController(AssetLibrary *assetLibrary, QObject *parent)
     // keyframe, and an animation appears where the user only meant to reposition something.
     m_autoKeyEnabled = settings.value(QStringLiteral("editor/autoKeyEnabled"), false).toBool();
     m_reopenLastProject = settings.value(QStringLiteral("editor/reopenLastProject"), false).toBool();
+    m_uiLanguage = storedUiLanguage();
     // Unset means the user has never toggled the theme, so the UI keeps tracking the OS.
     const QVariant storedDarkMode = settings.value(QStringLiteral("ui/darkMode"));
     m_darkModeOverridden = storedDarkMode.isValid();
@@ -1468,7 +1513,7 @@ bool AppController::removeAsset(int assetIndex)
     // Rows after the removed one shift down, so any index captured at drag
     // start now points at the wrong asset.
     setDraggingAssetIndex(-1);
-    pushProjectEdit(before, QStringLiteral("Media removed"));
+    pushProjectEdit(before, tr("Media removed"));
     return true;
 }
 
@@ -1489,8 +1534,8 @@ bool AppController::renameAsset(int assetIndex, const QString &name)
     if (!m_assetLibrary->setAssetName(assetIndex, trimmed))
         return false;
 
-    pushProjectEdit(before, QStringLiteral("Rename media"));
-    finishEdit(QStringLiteral("Media renamed"));
+    pushProjectEdit(before, tr("Rename media"));
+    finishEdit(tr("Media renamed"));
     return true;
 }
 
@@ -1617,8 +1662,8 @@ void AppController::finalizeAssetReplace(const QString &assetId, const drift::Me
     }
 
     const int adjusted = rebindClipsToAsset(assetId, filled);
-    pushProjectEdit(before, QStringLiteral("Media replaced"));
-    finishEdit(QStringLiteral("Media replaced"));
+    pushProjectEdit(before, tr("Media replaced"));
+    finishEdit(tr("Media replaced"));
     emit assetReplaceFinished(true, newName, adjusted);
 }
 
@@ -1751,37 +1796,37 @@ QVariantList AppController::actions() const
     };
 
     return {
-        action(QStringLiteral("newProject"), QStringLiteral("New project")),
-        action(QStringLiteral("open"), QStringLiteral("Open project")),
-        action(QStringLiteral("save"), QStringLiteral("Save project")),
-        action(QStringLiteral("playPause"), QStringLiteral("Play/Pause")),
-        action(QStringLiteral("delete"), QStringLiteral("Delete selection")),
-        action(QStringLiteral("undo"), QStringLiteral("Undo")),
-        action(QStringLiteral("redo"), QStringLiteral("Redo")),
-        action(QStringLiteral("copy"), QStringLiteral("Copy selection")),
-        action(QStringLiteral("cut"), QStringLiteral("Cut selection")),
-        action(QStringLiteral("paste"), QStringLiteral("Paste at current time")),
-        action(QStringLiteral("duplicate"), QStringLiteral("Duplicate selected clip")),
-        action(QStringLiteral("split"), QStringLiteral("Split at current time")),
-        action(QStringLiteral("merge"), QStringLiteral("Merge adjacent clips")),
-        action(QStringLiteral("separateAudio"), QStringLiteral("Separate audio")),
-        action(QStringLiteral("unlink"), QStringLiteral("Unlink audio")),
-        action(QStringLiteral("clearSelection"), QStringLiteral("Clear selection")),
-        action(QStringLiteral("selectAll"), QStringLiteral("Select all clips")),
-        action(QStringLiteral("nudgeLeft"), QStringLiteral("Move selection left a little")),
-        action(QStringLiteral("nudgeRight"), QStringLiteral("Move selection right a little")),
-        action(QStringLiteral("toggleGuides"), QStringLiteral("Toggle guides")),
-        action(QStringLiteral("toggleBookmark"), QStringLiteral("Add/remove bookmark at current time")),
-        action(QStringLiteral("nextBookmark"), QStringLiteral("Go to next bookmark")),
-        action(QStringLiteral("previousBookmark"), QStringLiteral("Go to previous bookmark")),
-        action(QStringLiteral("markIn"), QStringLiteral("Mark work area in")),
-        action(QStringLiteral("markOut"), QStringLiteral("Mark work area out")),
-        action(QStringLiteral("goToIn"), QStringLiteral("Go to work area in")),
-        action(QStringLiteral("goToOut"), QStringLiteral("Go to work area out")),
-        action(QStringLiteral("clearInOut"), QStringLiteral("Clear work area")),
-        action(QStringLiteral("toggleLoop"), QStringLiteral("Loop work area playback")),
-        action(QStringLiteral("selectTool"), QStringLiteral("Select tool")),
-        action(QStringLiteral("bladeTool"), QStringLiteral("Cut tool")),
+        action(QStringLiteral("newProject"), tr("New project")),
+        action(QStringLiteral("open"), tr("Open project")),
+        action(QStringLiteral("save"), tr("Save project")),
+        action(QStringLiteral("playPause"), tr("Play/Pause")),
+        action(QStringLiteral("delete"), tr("Delete selection")),
+        action(QStringLiteral("undo"), tr("Undo")),
+        action(QStringLiteral("redo"), tr("Redo")),
+        action(QStringLiteral("copy"), tr("Copy selection")),
+        action(QStringLiteral("cut"), tr("Cut selection")),
+        action(QStringLiteral("paste"), tr("Paste at current time")),
+        action(QStringLiteral("duplicate"), tr("Duplicate selected clip")),
+        action(QStringLiteral("split"), tr("Split at current time")),
+        action(QStringLiteral("merge"), tr("Merge adjacent clips")),
+        action(QStringLiteral("separateAudio"), tr("Separate audio")),
+        action(QStringLiteral("unlink"), tr("Unlink audio")),
+        action(QStringLiteral("clearSelection"), tr("Clear selection")),
+        action(QStringLiteral("selectAll"), tr("Select all clips")),
+        action(QStringLiteral("nudgeLeft"), tr("Move selection left a little")),
+        action(QStringLiteral("nudgeRight"), tr("Move selection right a little")),
+        action(QStringLiteral("toggleGuides"), tr("Toggle guides")),
+        action(QStringLiteral("toggleBookmark"), tr("Add/remove bookmark at current time")),
+        action(QStringLiteral("nextBookmark"), tr("Go to next bookmark")),
+        action(QStringLiteral("previousBookmark"), tr("Go to previous bookmark")),
+        action(QStringLiteral("markIn"), tr("Mark work area in")),
+        action(QStringLiteral("markOut"), tr("Mark work area out")),
+        action(QStringLiteral("goToIn"), tr("Go to work area in")),
+        action(QStringLiteral("goToOut"), tr("Go to work area out")),
+        action(QStringLiteral("clearInOut"), tr("Clear work area")),
+        action(QStringLiteral("toggleLoop"), tr("Loop work area playback")),
+        action(QStringLiteral("selectTool"), tr("Select tool")),
+        action(QStringLiteral("bladeTool"), tr("Cut tool")),
     };
 }
 
@@ -1893,6 +1938,16 @@ void AppController::setDarkModePreference(bool enabled)
     emit darkModePreferenceChanged();
 }
 
+void AppController::clearDarkModePreference()
+{
+    if (!m_darkModeOverridden)
+        return;
+    m_darkModeOverridden = false;
+    QSettings settings;
+    settings.remove(QStringLiteral("ui/darkMode"));
+    emit darkModePreferenceChanged();
+}
+
 void AppController::setWorkspaceLayoutPreference(const QString &layout)
 {
     const QString normalized = layout == QStringLiteral("portrait")
@@ -1943,6 +1998,81 @@ void AppController::setReopenLastProject(bool enabled)
     QSettings settings;
     settings.setValue(QStringLiteral("editor/reopenLastProject"), m_reopenLastProject);
     emit reopenLastProjectChanged();
+}
+
+void AppController::installUiTranslators()
+{
+    QCoreApplication *app = QCoreApplication::instance();
+    if (!app)
+        return;
+
+    app->removeTranslator(&g_appTranslator);
+    app->removeTranslator(&g_qtTranslator);
+
+    const QLocale locale = uiLocaleFromStored();
+    QLocale::setDefault(locale);
+    QGuiApplication::setLayoutDirection(locale.textDirection());
+
+    const QString translationsDir = QLibraryInfo::path(QLibraryInfo::TranslationsPath);
+    if (g_qtTranslator.load(locale, QStringLiteral("qtbase"), QStringLiteral("_"), translationsDir))
+        app->installTranslator(&g_qtTranslator);
+
+    if (locale.language() == QLocale::English)
+        return;
+
+    if (g_appTranslator.load(locale, QStringLiteral("drift"), QStringLiteral("_"), QStringLiteral(":/i18n")))
+        app->installTranslator(&g_appTranslator);
+}
+
+QVariantList AppController::uiLanguages() const
+{
+    QVariantList languages;
+
+    QVariantMap system;
+    system.insert(QStringLiteral("id"), QString());
+    system.insert(QStringLiteral("label"), tr("System default"));
+    languages.append(system);
+
+    QVariantMap english;
+    english.insert(QStringLiteral("id"), QStringLiteral("en"));
+    english.insert(QStringLiteral("label"), languageLabel(QStringLiteral("en")));
+    languages.append(english);
+
+    QStringList codes;
+    const QDir dir(QStringLiteral(":/i18n"));
+    const QStringList files = dir.entryList({QStringLiteral("drift_*.qm")}, QDir::Files);
+    for (const QString &file : files) {
+        if (!file.startsWith(QStringLiteral("drift_")) || !file.endsWith(QStringLiteral(".qm")))
+            continue;
+        const QString code = file.mid(6, file.size() - 9); // strip drift_ and .qm
+        if (code.isEmpty() || code.compare(QStringLiteral("en"), Qt::CaseInsensitive) == 0)
+            continue;
+        if (!codes.contains(code))
+            codes.append(code);
+    }
+    codes.sort(Qt::CaseInsensitive);
+    for (const QString &code : codes) {
+        QVariantMap entry;
+        entry.insert(QStringLiteral("id"), code);
+        entry.insert(QStringLiteral("label"), languageLabel(code));
+        languages.append(entry);
+    }
+    return languages;
+}
+
+void AppController::setUiLanguage(const QString &language)
+{
+    const QString normalized = language.trimmed();
+    if (m_uiLanguage == normalized)
+        return;
+    m_uiLanguage = normalized;
+    QSettings settings;
+    if (m_uiLanguage.isEmpty())
+        settings.remove(QStringLiteral("ui/language"));
+    else
+        settings.setValue(QStringLiteral("ui/language"), m_uiLanguage);
+    installUiTranslators();
+    emit uiLanguageChanged();
 }
 
 void AppController::toggleKeyframeGraphPropertyVisible(const QString &prop)
@@ -2235,6 +2365,8 @@ double AppController::sourceTimeAtPlayhead() const
 
 void AppController::pushProjectEdit(const drift::Project &before, const QString &text)
 {
+    if (m_mcpUndoSuspended)
+        return;
     m_undoStack.push(new drift::ProjectSnapshotCommand(&m_project, before, m_project, text));
 }
 
@@ -2268,6 +2400,7 @@ void AppController::finishEdit(const QString &message)
     // stack, so an edit now only clears a stale warning from an earlier attempt.
     Q_UNUSED(message)
     setLastMessage(QString());
+    ++m_mcpEditRevision;
 }
 
 void AppController::applyRippleShift(drift::Track &track, int fromClipIndex, drift::TimeUs delta)
@@ -2319,8 +2452,8 @@ void AppController::addClipFromAsset(int assetIndex)
     applyAssetLayout(clip, asset, m_project.width(), m_project.height());
 
     track.clips.append(clip);
-    pushProjectEdit(before, QStringLiteral("Clip added"));
-    finishEdit(QStringLiteral("Clip added"));
+    pushProjectEdit(before, tr("Clip added"));
+    finishEdit(tr("Clip added"));
     selectClip(trackIndex, track.clips.size() - 1);
 }
 
@@ -2392,8 +2525,8 @@ void AppController::addClipFromAssetOnNewTrackAt(int assetIndex, int insertIndex
     applyAssetLayout(clip, asset, m_project.width(), m_project.height());
 
     track.clips.append(clip);
-    pushProjectEdit(before, QStringLiteral("Clip added on new track"));
-    finishEdit(QStringLiteral("Clip added on new track"));
+    pushProjectEdit(before, tr("Clip added on new track"));
+    finishEdit(tr("Clip added on new track"));
     selectClip(trackIndex, track.clips.size() - 1);
 }
 
@@ -2436,8 +2569,8 @@ void AppController::addClipFromAssetAt(int assetIndex, int trackIndex, double at
     applyAssetLayout(clip, asset, m_project.width(), m_project.height());
 
     track.clips.append(clip);
-    pushProjectEdit(before, QStringLiteral("Clip added"));
-    finishEdit(QStringLiteral("Clip added"));
+    pushProjectEdit(before, tr("Clip added"));
+    finishEdit(tr("Clip added"));
     selectClip(trackIndex, track.clips.size() - 1);
 }
 
@@ -2557,9 +2690,9 @@ void AppController::deleteSelectedClip()
                 track.transitions.removeAt(i);
         }
     }
-    pushProjectEdit(before, QStringLiteral("Clip deleted"));
+    pushProjectEdit(before, tr("Clip deleted"));
     clearSelection();
-    finishEdit(QStringLiteral("Clip deleted"));
+    finishEdit(tr("Clip deleted"));
 }
 
 void AppController::moveClip(int trackIndex, int clipIndex, double newStart)
@@ -2602,8 +2735,8 @@ void AppController::moveClip(int trackIndex, int clipIndex, double newStart)
         const drift::Clip &clip = m_project.tracks().at(pair.first).clips.at(pair.second);
         syncLinkedPartnersFrom(m_project, clip, movedIds);
     }
-    pushProjectEdit(before, QStringLiteral("Clip moved"));
-    finishEdit(QStringLiteral("Clip moved"));
+    pushProjectEdit(before, tr("Clip moved"));
+    finishEdit(tr("Clip moved"));
 }
 
 void AppController::splitAtPlayhead()
@@ -2639,10 +2772,10 @@ void AppController::splitAtPlayhead()
     }
 
     if (splitAny) {
-        pushProjectEdit(before, QStringLiteral("Split at current time"));
-        finishEdit(QStringLiteral("Split at current time"));
+        pushProjectEdit(before, tr("Split at current time"));
+        finishEdit(tr("Split at current time"));
     } else {
-        setLastMessage(QStringLiteral("Nothing to split here — move to a clip first"), QStringLiteral("warning"));
+        setLastMessage(tr("Nothing to split here — move to a clip first"), QStringLiteral("warning"));
     }
 }
 
@@ -2671,8 +2804,8 @@ void AppController::splitClipAt(int trackIndex, int clipIndex, double seconds)
     splitLinkedPartnerAt(m_project, clip, atUs, tailLinkId);
     track.clips.insert(clipIndex + 1, tail);
 
-    pushProjectEdit(before, QStringLiteral("Split clip"));
-    finishEdit(QStringLiteral("Split clip"));
+    pushProjectEdit(before, tr("Split clip"));
+    finishEdit(tr("Split clip"));
 }
 
 void AppController::splitClipLeftAt(int trackIndex, int clipIndex, double seconds)
@@ -2705,8 +2838,8 @@ void AppController::splitClipLeftAt(int trackIndex, int clipIndex, double second
         applyRippleShift(track, clipIndex, -offset);
     }
 
-    pushProjectEdit(before, QStringLiteral("Split left"));
-    finishEdit(QStringLiteral("Split left"));
+    pushProjectEdit(before, tr("Split left"));
+    finishEdit(tr("Split left"));
     selectClip(trackIndex, clipIndex);
 }
 
@@ -2734,8 +2867,8 @@ void AppController::splitClipRightAt(int trackIndex, int clipIndex, double secon
 
     // Keep only the left half — everything right of the cut is dropped.
     applyRippleShift(track, clipIndex, clip.timelineDuration - oldDuration);
-    pushProjectEdit(before, QStringLiteral("Split right"));
-    finishEdit(QStringLiteral("Split right"));
+    pushProjectEdit(before, tr("Split right"));
+    finishEdit(tr("Split right"));
     selectClip(trackIndex, clipIndex);
 }
 
@@ -2903,8 +3036,8 @@ void AppController::setClipTrim(int trackIndex, int clipIndex, double inPoint, d
     clip.timelineDuration = qMax(clip.timelineDuration, drift::kMinClipDurationUs);
     // A ramp re-derives the duration from the range that survived the trim.
     clip.syncDurationFromSpeedCurve();
-    pushProjectEdit(before, QStringLiteral("Trim updated"));
-    finishEdit(QStringLiteral("Trim updated"));
+    pushProjectEdit(before, tr("Trim updated"));
+    finishEdit(tr("Trim updated"));
 }
 
 void AppController::duplicateSelectedClip()
@@ -2924,8 +3057,8 @@ void AppController::duplicateSelectedClip()
         m_project, track, -1, original.timelineEnd(), original.timelineDuration, m_snapEnabled, m_playheadUs);
 
     track.clips.append(copy);
-    pushProjectEdit(before, QStringLiteral("Clip duplicated"));
-    finishEdit(QStringLiteral("Clip duplicated"));
+    pushProjectEdit(before, tr("Clip duplicated"));
+    finishEdit(tr("Clip duplicated"));
     selectClip(m_selectedTrack, track.clips.size() - 1);
 }
 
@@ -2963,8 +3096,8 @@ void AppController::splitSelectedClipLeft()
     // Keep only the right half (discard left) — same as previous "split left" behavior.
     track.clips[m_selectedClip] = right;
 
-    pushProjectEdit(before, QStringLiteral("Split left"));
-    finishEdit(QStringLiteral("Split left"));
+    pushProjectEdit(before, tr("Split left"));
+    finishEdit(tr("Split left"));
     selectClip(m_selectedTrack, m_selectedClip);
 }
 
@@ -2989,8 +3122,8 @@ void AppController::splitSelectedClipRight()
         return;
 
     // Keep only the left half (discard right) — same as previous "split right" behavior.
-    pushProjectEdit(before, QStringLiteral("Split right"));
-    finishEdit(QStringLiteral("Split right"));
+    pushProjectEdit(before, tr("Split right"));
+    finishEdit(tr("Split right"));
     selectClip(m_selectedTrack, m_selectedClip);
 }
 
@@ -3042,8 +3175,8 @@ void AppController::moveClipToTrack(int trackIndex, int clipIndex, int newTrackI
     m_selectedTransitionTrack = -1;
     m_selectedTransitionLeftClip = -1;
 
-    pushProjectEdit(before, QStringLiteral("Clip moved"));
-    finishEdit(QStringLiteral("Clip moved"));
+    pushProjectEdit(before, tr("Clip moved"));
+    finishEdit(tr("Clip moved"));
 }
 
 void AppController::addTextClip(const QString &text, double atSeconds, const QString &presetId)
@@ -3084,8 +3217,8 @@ void AppController::addTextClip(const QString &text, double atSeconds, const QSt
 
     track.clips.append(clip);
     const int newClipIndex = track.clips.size() - 1;
-    pushProjectEdit(before, QStringLiteral("Text clip added"));
-    finishEdit(QStringLiteral("Text clip added"));
+    pushProjectEdit(before, tr("Text clip added"));
+    finishEdit(tr("Text clip added"));
     selectClip(trackIndex, newClipIndex);
 
     if (placeholder) {
@@ -3115,7 +3248,7 @@ void AppController::addSubtitleClip(double atSeconds)
     drift::Clip clip;
     clip.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
     clip.type = drift::ClipType::Subtitle;
-    clip.name = QStringLiteral("Subtitles");
+    clip.name = tr("Subtitles");
     clip.timelineStart = start;
     clip.timelineDuration = drift::kSubtitleClipDurationUs;
     clip.srcIn = 0;
@@ -3125,8 +3258,8 @@ void AppController::addSubtitleClip(double atSeconds)
     applyDefaultVisualLayout(clip, m_project.width(), m_project.height());
 
     track.clips.append(clip);
-    pushProjectEdit(before, QStringLiteral("Subtitle clip added"));
-    finishEdit(QStringLiteral("Subtitle clip added"));
+    pushProjectEdit(before, tr("Subtitle clip added"));
+    finishEdit(tr("Subtitle clip added"));
     selectClip(trackIndex, track.clips.size() - 1);
 }
 
@@ -3146,14 +3279,14 @@ bool AppController::importSubtitleFile(const QUrl &url, double atSeconds)
 {
     const QString path = url.toLocalFile();
     if (path.isEmpty()) {
-        setLastMessage(QStringLiteral("No subtitle file selected"));
+        setLastMessage(tr("No subtitle file selected"));
         return false;
     }
 
     QList<drift::SubtitleCue> cues;
     QString error;
     if (!drift::parseSrtFile(path, &cues, &error)) {
-        setLastMessage(error.isEmpty() ? QStringLiteral("Could not read subtitle file") : error, QStringLiteral("error"));
+        setLastMessage(error.isEmpty() ? tr("Could not read subtitle file") : error, QStringLiteral("error"));
         return false;
     }
 
@@ -3184,10 +3317,10 @@ bool AppController::importSubtitleFile(const QUrl &url, double atSeconds)
     applyDefaultVisualLayout(clip, m_project.width(), m_project.height());
 
     track.clips.append(clip);
-    pushProjectEdit(before, QStringLiteral("Subtitles imported"));
-    finishEdit(QStringLiteral("Subtitles imported"));
+    pushProjectEdit(before, tr("Subtitles imported"));
+    finishEdit(tr("Subtitles imported"));
     selectClip(trackIndex, track.clips.size() - 1);
-    setLastMessage(QStringLiteral("Imported %1 subtitle(s)").arg(cues.size()));
+    setLastMessage(tr("Imported %n subtitles", "", int(cues.size())));
     return true;
 }
 
@@ -3202,20 +3335,20 @@ bool AppController::importSubtitleFileIntoClip(int trackIndex, int clipIndex, co
 
     drift::Clip &clip = track.clips[clipIndex];
     if (clip.type != drift::ClipType::Subtitle) {
-        setLastMessage(QStringLiteral("Select a subtitle clip to import into"), QStringLiteral("warning"));
+        setLastMessage(tr("Select a subtitle clip to import into"), QStringLiteral("warning"));
         return false;
     }
 
     const QString path = url.toLocalFile();
     if (path.isEmpty()) {
-        setLastMessage(QStringLiteral("No subtitle file selected"));
+        setLastMessage(tr("No subtitle file selected"));
         return false;
     }
 
     QList<drift::SubtitleCue> cues;
     QString error;
     if (!drift::parseSrtFile(path, &cues, &error)) {
-        setLastMessage(error.isEmpty() ? QStringLiteral("Could not read subtitle file") : error, QStringLiteral("error"));
+        setLastMessage(error.isEmpty() ? tr("Could not read subtitle file") : error, QStringLiteral("error"));
         return false;
     }
 
@@ -3227,9 +3360,9 @@ bool AppController::importSubtitleFileIntoClip(int trackIndex, int clipIndex, co
         clip.timelineDuration = duration;
         clip.srcOut = duration;
     }
-    pushProjectEdit(before, QStringLiteral("Subtitles imported"));
-    finishEdit(QStringLiteral("Subtitles imported"));
-    setLastMessage(QStringLiteral("Imported %1 subtitle(s)").arg(cues.size()));
+    pushProjectEdit(before, tr("Subtitles imported"));
+    finishEdit(tr("Subtitles imported"));
+    setLastMessage(tr("Imported %n subtitles", "", int(cues.size())));
     return true;
 }
 
@@ -3244,27 +3377,27 @@ bool AppController::exportSubtitleFile(int trackIndex, int clipIndex, const QUrl
 
     const drift::Clip &clip = track.clips.at(clipIndex);
     if (clip.type != drift::ClipType::Subtitle) {
-        setLastMessage(QStringLiteral("Select a subtitle clip to export"), QStringLiteral("warning"));
+        setLastMessage(tr("Select a subtitle clip to export"), QStringLiteral("warning"));
         return false;
     }
     if (clip.subtitleCues.isEmpty()) {
-        setLastMessage(QStringLiteral("This subtitle clip has no captions"), QStringLiteral("warning"));
+        setLastMessage(tr("This subtitle clip has no captions"), QStringLiteral("warning"));
         return false;
     }
 
     const QString path = url.toLocalFile();
     if (path.isEmpty()) {
-        setLastMessage(QStringLiteral("No save location selected"));
+        setLastMessage(tr("No save location selected"));
         return false;
     }
 
     QString error;
     if (!drift::writeSrtFile(path, clip.subtitleCues, &error)) {
-        setLastMessage(error.isEmpty() ? QStringLiteral("Could not write subtitle file") : error, QStringLiteral("error"));
+        setLastMessage(error.isEmpty() ? tr("Could not write subtitle file") : error, QStringLiteral("error"));
         return false;
     }
 
-    setLastMessage(QStringLiteral("Subtitles saved"), QStringLiteral("success"));
+    setLastMessage(tr("Subtitles saved"), QStringLiteral("success"));
     return true;
 }
 
@@ -3279,7 +3412,7 @@ QVariantList AppController::whisperLanguages()
     QVariantList out;
     QVariantMap autoRow;
     autoRow.insert(QStringLiteral("code"), QString());
-    autoRow.insert(QStringLiteral("label"), QStringLiteral("Auto-detect"));
+    autoRow.insert(QStringLiteral("label"), tr("Auto-detect"));
     out.append(autoRow);
 
     const QVariantList langs = drift::WhisperTranscriber::instance().supportedLanguages();
@@ -3291,7 +3424,7 @@ QVariantList AppController::whisperLanguages()
 void AppController::generateSubtitlesForClip(int trackIndex, int clipIndex, const QString &language)
 {
     if (m_subtitleGenerating) {
-        setLastMessage(QStringLiteral("Subtitle generation already in progress"), QStringLiteral("warning"));
+        setLastMessage(tr("Subtitle generation already in progress"), QStringLiteral("warning"));
         return;
     }
     if (trackIndex < 0 || trackIndex >= m_project.tracks().size())
@@ -3302,11 +3435,11 @@ void AppController::generateSubtitlesForClip(int trackIndex, int clipIndex, cons
 
     const drift::Clip clip = track.clips.at(clipIndex);
     if (clip.type != drift::ClipType::Video && clip.type != drift::ClipType::Audio) {
-        setLastMessage(QStringLiteral("Select a video or audio clip to create captions"), QStringLiteral("warning"));
+        setLastMessage(tr("Select a video or audio clip to create captions"), QStringLiteral("warning"));
         return;
     }
     if (clip.path.isEmpty() || clip.srcOut <= clip.srcIn) {
-        setLastMessage(QStringLiteral("This clip has no sound"), QStringLiteral("warning"));
+        setLastMessage(tr("This clip has no sound"), QStringLiteral("warning"));
         return;
     }
 
@@ -3315,11 +3448,11 @@ void AppController::generateSubtitlesForClip(int trackIndex, int clipIndex, cons
     m_subtitleGenCancel.storeRelaxed(0);
     m_subtitleGenProgress = 0.0;
     emit subtitleGenProgressChanged();
-    m_subtitleGenStatus = QStringLiteral("Starting…");
+    m_subtitleGenStatus = tr("Starting…");
     emit subtitleGenStatusChanged();
     m_subtitleGenerating = true;
     emit subtitleGeneratingChanged();
-    setLastMessage(QStringLiteral("Creating captions..."));
+    setLastMessage(tr("Creating captions…"));
 
     const QString path = clip.path;
     const drift::TimeUs srcIn = clip.srcIn;
@@ -3355,7 +3488,7 @@ void AppController::generateSubtitlesForClip(int trackIndex, int clipIndex, cons
                     emit subtitleGeneratingChanged();
                     m_subtitleGenProgress = ok ? 1.0 : 0.0;
                     emit subtitleGenProgressChanged();
-                    m_subtitleGenStatus = ok ? QStringLiteral("Done") : message;
+                    m_subtitleGenStatus = ok ? tr("Done") : message;
                     emit subtitleGenStatusChanged();
                     if (!ok || cues.isEmpty()) {
                         setLastMessage(message, QStringLiteral("error"));
@@ -3367,7 +3500,7 @@ void AppController::generateSubtitlesForClip(int trackIndex, int clipIndex, cons
                 Qt::QueuedConnection);
         };
 
-        setProgress(0.02, QStringLiteral("Getting speech recognition ready…"));
+        setProgress(0.02, tr("Getting speech recognition ready…"));
         drift::WhisperTranscriber &whisper = drift::WhisperTranscriber::instance();
         if (!whisper.available()) {
             qWarning() << "[subtitles] whisper unavailable:" << whisper.lastError();
@@ -3376,7 +3509,7 @@ void AppController::generateSubtitlesForClip(int trackIndex, int clipIndex, cons
         }
 
         // Decode the clip's raw source audio over [srcIn, srcOut] at 16 kHz mono.
-        setProgress(0.05, QStringLiteral("Reading audio…"));
+        setProgress(0.05, tr("Reading audio…"));
         const int rate = 16000;
         const int chunkFrames = 30 * rate;
         std::vector<float> mono;
@@ -3384,7 +3517,7 @@ void AppController::generateSubtitlesForClip(int trackIndex, int clipIndex, cons
         const drift::TimeUs spanUs = std::max<drift::TimeUs>(1, srcOut - srcIn);
         while (pos < srcOut) {
             if (m_subtitleGenCancel.loadRelaxed()) {
-                finish(false, QStringLiteral("Subtitle generation cancelled"), {});
+                finish(false, tr("Subtitle generation cancelled"), {});
                 return;
             }
             const drift::TimeUs remainUs = srcOut - pos;
@@ -3405,7 +3538,7 @@ void AppController::generateSubtitlesForClip(int trackIndex, int clipIndex, cons
             pos += static_cast<drift::TimeUs>((static_cast<int64_t>(got) * drift::kUsPerSecond) / rate);
             const double decodeFrac = static_cast<double>(pos - srcIn) / static_cast<double>(spanUs);
             setProgress(0.05 + 0.10 * std::min(1.0, decodeFrac),
-                        QStringLiteral("Reading audio… %1%")
+                        tr("Reading audio… %1%")
                             .arg(qRound(100.0 * std::min(1.0, decodeFrac))));
         }
 
@@ -3413,13 +3546,13 @@ void AppController::generateSubtitlesForClip(int trackIndex, int clipIndex, cons
                    << "seconds:" << (mono.size() / 16000.0) << "language:"
                    << (languageCode.isEmpty() ? QStringLiteral("auto") : languageCode);
         if (mono.empty()) {
-            finish(false, QStringLiteral("No audio decoded"), {});
+            finish(false, tr("No audio decoded"), {});
             return;
         }
 
         setProgress(0.15, languageCode.isEmpty()
-                              ? QStringLiteral("Transcribing…")
-                              : QStringLiteral("Transcribing (%1)…").arg(languageCode));
+                              ? tr("Transcribing…")
+                              : tr("Transcribing (%1)…").arg(languageCode));
 
         const drift::WhisperResult res = whisper.transcribe(
             mono,
@@ -3434,7 +3567,7 @@ void AppController::generateSubtitlesForClip(int trackIndex, int clipIndex, cons
                    << "cues:" << res.cues.size() << "error:" << res.error;
 
         if (res.cancelled) {
-            finish(false, QStringLiteral("Subtitle generation cancelled"), {});
+            finish(false, tr("Subtitle generation cancelled"), {});
             return;
         }
         if (!res.ok) {
@@ -3442,7 +3575,7 @@ void AppController::generateSubtitlesForClip(int trackIndex, int clipIndex, cons
             return;
         }
 
-        setProgress(0.96, QStringLiteral("Building caption track…"));
+        setProgress(0.96, tr("Building caption track…"));
 
         // Map source-relative cue times onto clip-relative timeline time (accounts for
         // speed and reverse), clamped to the clip's duration.
@@ -3469,10 +3602,10 @@ void AppController::generateSubtitlesForClip(int trackIndex, int clipIndex, cons
                    << "timelineDuration us:" << timelineDuration << "speed:" << speed;
 
         if (mapped.isEmpty()) {
-            finish(false, QStringLiteral("No speech detected"), {});
+            finish(false, tr("No speech detected"), {});
             return;
         }
-        finish(true, QStringLiteral("Subtitles generated"), mapped);
+        finish(true, tr("Subtitles generated"), mapped);
     });
 }
 
@@ -3503,7 +3636,7 @@ void AppController::beginSegmentationSession(int trackIndex, int clipIndex, doub
     if (clipIndex < 0 || clipIndex >= track.clips.size())
         return;
     if (track.clips.at(clipIndex).type != drift::ClipType::Video) {
-        setLastMessage(QStringLiteral("Select a video clip to cut out"), QStringLiteral("warning"));
+        setLastMessage(tr("Select a video clip to cut out"), QStringLiteral("warning"));
         return;
     }
 
@@ -3526,11 +3659,11 @@ void AppController::beginSpeedCurveSession(int trackIndex, int clipIndex)
 
     const drift::Clip &clip = track.clips.at(clipIndex);
     if (clip.type != drift::ClipType::Video && clip.type != drift::ClipType::Audio) {
-        setLastMessage(QStringLiteral("Custom speed works on video and audio clips"), QStringLiteral("warning"));
+        setLastMessage(tr("Custom speed works on video and audio clips"), QStringLiteral("warning"));
         return;
     }
     if (clip.path.isEmpty() || clip.srcOut <= clip.srcIn) {
-        setLastMessage(QStringLiteral("This clip has no media to speed up or slow down"), QStringLiteral("warning"));
+        setLastMessage(tr("This clip has no media to speed up or slow down"), QStringLiteral("warning"));
         return;
     }
 
@@ -3693,7 +3826,7 @@ void AppController::applySpeedCurve()
     // The timeline stays editable while the window is open, so the indices captured at the start
     // of the session can point at a different clip by now.
     if (source.id != m_speedCurveClip.id) {
-        setLastMessage(QStringLiteral("That clip moved — open Custom speed again"), QStringLiteral("warning"));
+        setLastMessage(tr("That clip moved — open Custom speed again"), QStringLiteral("warning"));
         return;
     }
 
@@ -3734,8 +3867,8 @@ void AppController::applySpeedCurve()
         }
     }
 
-    pushProjectEdit(before, QStringLiteral("Custom speed applied"));
-    finishEdit(QStringLiteral("Custom speed applied"));
+    pushProjectEdit(before, tr("Custom speed applied"));
+    finishEdit(tr("Custom speed applied"));
     selectClip(newTrack, m_project.tracks().at(newTrack).clips.size() - 1);
     emit speedCurveApplied();
 }
@@ -3758,8 +3891,8 @@ void AppController::clearClipSpeedCurve(int trackIndex, int clipIndex)
     // from is exactly the thing being discarded.
     clip.timelineDuration = qMax<drift::TimeUs>(
         1, llround(static_cast<double>(clip.srcOut - clip.srcIn) / clip.effectiveSpeed()));
-    pushProjectEdit(before, QStringLiteral("Speed curve removed"));
-    finishEdit(QStringLiteral("Speed curve removed"));
+    pushProjectEdit(before, tr("Speed curve removed"));
+    finishEdit(tr("Speed curve removed"));
 }
 
 void AppController::beginFadeCurveSession(int trackIndex, int clipIndex)
@@ -3910,7 +4043,7 @@ void AppController::applyFadeCurve()
         return;
     drift::Clip &clip = track.clips[m_fadeCurveClipIndex];
     if (clip.id != m_fadeCurveClipId) {
-        setLastMessage(QStringLiteral("That clip moved — open Custom fade again"), QStringLiteral("warning"));
+        setLastMessage(tr("That clip moved — open Custom fade again"), QStringLiteral("warning"));
         return;
     }
 
@@ -3942,9 +4075,9 @@ void AppController::applyFadeCurve()
     if (clip.animOut.curve == drift::FadeCurve::Custom)
         clip.animOut.shape = m_fadeShape;
     syncLinkedPartnersFrom(m_project, clip);
-    pushProjectEdit(before, QStringLiteral("Custom fade applied"));
+    pushProjectEdit(before, tr("Custom fade applied"));
     m_fadeCurveApplied = true;
-    finishEdit(QStringLiteral("Custom fade applied"));
+    finishEdit(tr("Custom fade applied"));
     emit fadeCurveApplied();
     endFadeCurveSession();
 }
@@ -4144,7 +4277,7 @@ void AppController::segmentClip(int trackIndex, int clipIndex, const QVariantLis
                                 const QString &outputMode)
 {
     if (m_segmenting) {
-        setLastMessage(QStringLiteral("Cutout is already running"), QStringLiteral("warning"));
+        setLastMessage(tr("Cutout is already running"), QStringLiteral("warning"));
         return;
     }
     if (trackIndex < 0 || trackIndex >= m_project.tracks().size())
@@ -4155,15 +4288,15 @@ void AppController::segmentClip(int trackIndex, int clipIndex, const QVariantLis
 
     const drift::Clip clip = track.clips.at(clipIndex);
     if (clip.type != drift::ClipType::Video) {
-        setLastMessage(QStringLiteral("Select a video clip to cut out"), QStringLiteral("warning"));
+        setLastMessage(tr("Select a video clip to cut out"), QStringLiteral("warning"));
         return;
     }
     if (clip.path.isEmpty() || clip.srcOut <= clip.srcIn) {
-        setLastMessage(QStringLiteral("This clip has no video to cut out"), QStringLiteral("warning"));
+        setLastMessage(tr("This clip has no video to cut out"), QStringLiteral("warning"));
         return;
     }
     if (points.isEmpty()) {
-        setLastMessage(QStringLiteral("Click the subject first"), QStringLiteral("warning"));
+        setLastMessage(tr("Click the subject first"), QStringLiteral("warning"));
         return;
     }
 
@@ -4184,11 +4317,11 @@ void AppController::segmentClip(int trackIndex, int clipIndex, const QVariantLis
     m_segmentCancel.storeRelaxed(0);
     m_segmentProgress = 0.0;
     emit segmentProgressChanged();
-    m_segmentStatus = QStringLiteral("Getting ready…");
+    m_segmentStatus = tr("Getting ready…");
     emit segmentStatusChanged();
     m_segmenting = true;
     emit segmentingChanged();
-    setLastMessage(QStringLiteral("Cutting out subject..."));
+    setLastMessage(tr("Cutting out subject…"));
 
     const QString path = clip.path;
     const drift::TimeUs srcIn = clip.srcIn;
@@ -4226,7 +4359,7 @@ void AppController::segmentClip(int trackIndex, int clipIndex, const QVariantLis
                     emit segmentingChanged();
                     m_segmentProgress = ok ? 1.0 : 0.0;
                     emit segmentProgressChanged();
-                    m_segmentStatus = ok ? QStringLiteral("Done") : message;
+                    m_segmentStatus = ok ? tr("Done") : message;
                     emit segmentStatusChanged();
                     if (!ok) {
                         setLastMessage(message, QStringLiteral("error"));
@@ -4264,13 +4397,13 @@ void AppController::segmentClip(int trackIndex, int clipIndex, const QVariantLis
         const drift::TimeUs step = drift::kUsPerSecond / fps;
         const int totalFrames = int((srcOut - srcIn + step - 1) / step);
         if (totalFrames <= 0) {
-            finish(false, QStringLiteral("Clip is too short to cut out"), {});
+            finish(false, tr("Clip is too short to cut out"), {});
             return;
         }
 
         const QString mattePath = drift::newMattePath();
         if (mattePath.isEmpty()) {
-            finish(false, QStringLiteral("Could not create a cutout file"), {});
+            finish(false, tr("Could not create a cutout file"), {});
             return;
         }
 
@@ -4287,7 +4420,7 @@ void AppController::segmentClip(int trackIndex, int clipIndex, const QVariantLis
         for (int i = 0; i < totalFrames; ++i) {
             if (m_segmentCancel.loadRelaxed() != 0) {
                 writer.abort();
-                finish(false, QStringLiteral("Cutout cancelled"), {});
+                finish(false, tr("Cutout cancelled"), {});
                 return;
             }
 
@@ -4296,7 +4429,7 @@ void AppController::segmentClip(int trackIndex, int clipIndex, const QVariantLis
                 ClipReaderPool::instance().readVideoFrame(path, sourceUs, canvasW, canvasH);
             if (frame.isNull()) {
                 writer.abort();
-                finish(false, QStringLiteral("Could not decode frame %1").arg(i), {});
+                finish(false, tr("Could not decode frame %1").arg(i), {});
                 return;
             }
 
@@ -4345,7 +4478,7 @@ void AppController::segmentClip(int trackIndex, int clipIndex, const QVariantLis
             }
 
             setProgress(double(i + 1) / totalFrames,
-                        QStringLiteral("Processing frame %1 of %2\u2026").arg(i + 1).arg(totalFrames));
+                        tr("Processing frame %1 of %2\u2026").arg(i + 1).arg(totalFrames));
         }
 
         if (!writer.finish(&error)) {
@@ -4358,10 +4491,10 @@ void AppController::segmentClip(int trackIndex, int clipIndex, const QVariantLis
         // itself — but a clip that is mostly occluded usually means the wrong subject was marked.
         finish(true,
                occludedFrames > 0
-                   ? QStringLiteral("Cutout complete — subject cut out on %1 of %2 frames")
+                   ? tr("Cutout complete — subject cut out on %1 of %2 frames")
                          .arg(occludedFrames)
                          .arg(totalFrames)
-                   : QStringLiteral("Cutout complete"),
+                   : tr("Cutout complete"),
                mattePath);
     });
 }
@@ -4391,14 +4524,14 @@ void AppController::clearFaceTrack(int trackIndex, int clipIndex)
     const drift::Project before = m_project;
     m_project.tracks()[trackIndex].clips[clipIndex].faceTrackPath.clear();
     m_project.tracks()[trackIndex].clips[clipIndex].faceTrackSrcOffsetUs = 0;
-    pushProjectEdit(before, QStringLiteral("Clear Face Track"));
-    finishEdit(QStringLiteral("Clear Face Track"));
+    pushProjectEdit(before, tr("Clear Face Track"));
+    finishEdit(tr("Clear Face Track"));
 }
 
 void AppController::detectFacesForClip(int trackIndex, int clipIndex)
 {
     if (m_faceDetecting) {
-        setLastMessage(QStringLiteral("Face detection already in progress"), QStringLiteral("warning"));
+        setLastMessage(tr("Face detection already in progress"), QStringLiteral("warning"));
         return;
     }
     if (trackIndex < 0 || trackIndex >= m_project.tracks().size())
@@ -4409,11 +4542,11 @@ void AppController::detectFacesForClip(int trackIndex, int clipIndex)
 
     const drift::Clip clip = track.clips.at(clipIndex);
     if (clip.type != drift::ClipType::Video && clip.type != drift::ClipType::Image) {
-        setLastMessage(QStringLiteral("Select a video clip to detect faces in"), QStringLiteral("warning"));
+        setLastMessage(tr("Select a video clip to detect faces in"), QStringLiteral("warning"));
         return;
     }
     if (clip.path.isEmpty() || clip.srcOut <= clip.srcIn) {
-        setLastMessage(QStringLiteral("Clip has no video to scan"), QStringLiteral("warning"));
+        setLastMessage(tr("Clip has no video to scan"), QStringLiteral("warning"));
         return;
     }
 
@@ -4424,11 +4557,11 @@ void AppController::detectFacesForClip(int trackIndex, int clipIndex)
     m_faceDetectCancel.storeRelaxed(0);
     m_faceDetectProgress = 0.0;
     emit faceDetectProgressChanged();
-    m_faceDetectStatus = QStringLiteral("Getting ready…");
+    m_faceDetectStatus = tr("Getting ready…");
     emit faceDetectStatusChanged();
     m_faceDetecting = true;
     emit faceDetectingChanged();
-    setLastMessage(QStringLiteral("Detecting faces..."));
+    setLastMessage(tr("Detecting faces…"));
 
     const QString path = clip.path;
     const drift::TimeUs srcIn = clip.srcIn;
@@ -4464,7 +4597,7 @@ void AppController::detectFacesForClip(int trackIndex, int clipIndex)
                     emit faceDetectingChanged();
                     m_faceDetectProgress = ok ? 1.0 : 0.0;
                     emit faceDetectProgressChanged();
-                    m_faceDetectStatus = ok ? QStringLiteral("Done") : message;
+                    m_faceDetectStatus = ok ? tr("Done") : message;
                     emit faceDetectStatusChanged();
                     if (!ok) {
                         setLastMessage(message, QStringLiteral("error"));
@@ -4487,7 +4620,7 @@ void AppController::detectFacesForClip(int trackIndex, int clipIndex)
         const drift::TimeUs step = drift::kUsPerSecond / fps;
         const int totalFrames = int((srcOut - srcIn + step - 1) / step);
         if (totalFrames <= 0) {
-            finish(false, QStringLiteral("Clip is too short to scan"), {});
+            finish(false, tr("Clip is too short to scan"), {});
             return;
         }
 
@@ -4501,7 +4634,7 @@ void AppController::detectFacesForClip(int trackIndex, int clipIndex)
 
         for (int i = 0; i < totalFrames; ++i) {
             if (m_faceDetectCancel.loadRelaxed() != 0) {
-                finish(false, QStringLiteral("Face detection cancelled"), {});
+                finish(false, tr("Face detection cancelled"), {});
                 return;
             }
 
@@ -4509,7 +4642,7 @@ void AppController::detectFacesForClip(int trackIndex, int clipIndex)
             const QImage frame =
                 ClipReaderPool::instance().readVideoFrame(path, sourceUs, canvasW, canvasH);
             if (frame.isNull()) {
-                finish(false, QStringLiteral("Could not decode frame %1").arg(i), {});
+                finish(false, tr("Could not decode frame %1").arg(i), {});
                 return;
             }
 
@@ -4531,11 +4664,11 @@ void AppController::detectFacesForClip(int trackIndex, int clipIndex)
             }
 
             setProgress(double(i + 1) / totalFrames,
-                        QStringLiteral("Scanning frame %1 of %2…").arg(i + 1).arg(totalFrames));
+                        tr("Scanning frame %1 of %2…").arg(i + 1).arg(totalFrames));
         }
 
         if (framesWithFace == 0) {
-            finish(false, QStringLiteral("No faces found in this clip"), {});
+            finish(false, tr("No faces found in this clip"), {});
             return;
         }
 
@@ -4544,17 +4677,17 @@ void AppController::detectFacesForClip(int trackIndex, int clipIndex)
         const QString trackPath = drift::newFaceTrackPath();
         QString error;
         if (trackPath.isEmpty() || !drift::writeFaceTrack(trackPath, faceTrack, &error)) {
-            finish(false, error.isEmpty() ? QStringLiteral("Could not write the face track") : error,
+            finish(false, error.isEmpty() ? tr("Could not write the face track") : error,
                    {});
             return;
         }
 
         finish(true,
                framesWithFace < totalFrames
-                   ? QStringLiteral("Face detection complete — a face was visible in %1 of %2 frames")
+                   ? tr("Face detection complete — a face was visible in %1 of %2 frames")
                          .arg(framesWithFace)
                          .arg(totalFrames)
-                   : QStringLiteral("Face detection complete"),
+                   : tr("Face detection complete"),
                trackPath);
     });
 }
@@ -4577,15 +4710,15 @@ void AppController::finalizeFaceDetection(const QString &clipId, const QString &
     if (trackIndex < 0) {
         // The clip was deleted while the job ran; the track has nothing to attach to.
         QFile::remove(trackPath);
-        setLastMessage(QStringLiteral("Scanned clip no longer exists"), QStringLiteral("warning"));
+        setLastMessage(tr("Scanned clip no longer exists"), QStringLiteral("warning"));
         return;
     }
 
     const drift::Project before = m_project;
     m_project.tracks()[trackIndex].clips[clipIndex].faceTrackPath = trackPath;
     m_project.tracks()[trackIndex].clips[clipIndex].faceTrackSrcOffsetUs = srcOffsetUs;
-    pushProjectEdit(before, QStringLiteral("Detect Faces"));
-    finishEdit(QStringLiteral("Detect Faces"));
+    pushProjectEdit(before, tr("Detect Faces"));
+    finishEdit(tr("Detect Faces"));
     selectClip(trackIndex, clipIndex);
 }
 
@@ -4607,7 +4740,7 @@ void AppController::finalizeSegmentation(const QString &clipId, const QString &m
     if (trackIndex < 0) {
         // The clip was deleted while the job ran; the matte has nothing to attach to.
         QFile::remove(mattePath);
-        setLastMessage(QStringLiteral("That clip no longer exists"), QStringLiteral("warning"));
+        setLastMessage(tr("That clip no longer exists"), QStringLiteral("warning"));
         return;
     }
 
@@ -4621,8 +4754,8 @@ void AppController::finalizeSegmentation(const QString &clipId, const QString &m
 
     if (outputMode == QStringLiteral("mask")) {
         m_project.tracks()[trackIndex].clips[clipIndex].mask = matte;
-        pushProjectEdit(before, QStringLiteral("Cut out subject"));
-        finishEdit(QStringLiteral("Cut out subject"));
+        pushProjectEdit(before, tr("Cut out subject"));
+        finishEdit(tr("Cut out subject"));
         selectClip(trackIndex, clipIndex);
         return;
     }
@@ -4636,7 +4769,7 @@ void AppController::finalizeSegmentation(const QString &clipId, const QString &m
         clip.linkId.clear();
         clip.mask = matte;
         clip.mask.invert = invert;
-        clip.name = (source.name.isEmpty() ? QStringLiteral("Clip") : source.name) + suffix;
+        clip.name = (source.name.isEmpty() ? tr("Clip") : source.name) + suffix;
         return clip;
     };
 
@@ -4647,8 +4780,8 @@ void AppController::finalizeSegmentation(const QString &clipId, const QString &m
     const int fgTrack = drift::insertTrackAtTopForClipType(m_project, drift::ClipType::Video);
     m_project.tracks()[fgTrack].clips.append(derive(false, QStringLiteral(" (foreground)")));
 
-    pushProjectEdit(before, QStringLiteral("Cut out subject"));
-    finishEdit(QStringLiteral("Cut out subject"));
+    pushProjectEdit(before, tr("Cut out subject"));
+    finishEdit(tr("Cut out subject"));
     selectClip(fgTrack, m_project.tracks().at(fgTrack).clips.size() - 1);
 }
 
@@ -4695,24 +4828,24 @@ bool AppController::renderDenoisedAudio(const QString &path, drift::TimeUs srcIn
     };
 
     drift::DeepFilterDenoiser &dn = drift::DeepFilterDenoiser::instance();
-    setProgress(span01(0.0), QStringLiteral("Getting noise removal ready…"));
+    setProgress(span01(0.0), tr("Getting noise removal ready…"));
     if (!dn.available())
         return fail(dn.lastError());
 
     const int rate = drift::DeepFilterDenoiser::sampleRate();
     const int64_t totalFrames = (span * rate) / drift::kUsPerSecond;
     if (totalFrames <= 0)
-        return fail(QStringLiteral("Clip is too short to process"));
+        return fail(tr("Clip is too short to process"));
 
     // Decode the raw source window. Speed and reverse are deliberately not applied: the derived
     // clip inherits them, so the render has to stay in the source's own time base.
-    setProgress(span01(0.05), QStringLiteral("Reading audio…"));
+    setProgress(span01(0.05), tr("Reading audio…"));
     std::vector<float> interleaved(size_t(totalFrames) * 2, 0.0f);
     int64_t have = 0;
     const int chunkFrames = rate * 10;
     while (have < totalFrames) {
         if (m_denoiseCancel.loadRelaxed())
-            return fail(QStringLiteral("Noise removal cancelled"));
+            return fail(tr("Noise removal cancelled"));
         const drift::TimeUs at = srcIn + drift::TimeUs((have * drift::kUsPerSecond) / rate);
         const int want = int(std::min<int64_t>(chunkFrames, totalFrames - have));
         const int got = ClipReaderPool::instance().readAudioInterleaved(
@@ -4721,10 +4854,10 @@ bool AppController::renderDenoisedAudio(const QString &path, drift::TimeUs srcIn
             break;
         have += got;
         setProgress(span01(0.05 + 0.20 * double(have) / double(totalFrames)),
-                    QStringLiteral("Reading audio…"));
+                    tr("Reading audio…"));
     }
     if (have <= 0)
-        return fail(QStringLiteral("No audio decoded"));
+        return fail(tr("No audio decoded"));
     interleaved.resize(size_t(have) * 2);
 
     // The A/B source for the preview window, written before the model runs so a cancel still
@@ -4749,19 +4882,19 @@ bool AppController::renderDenoisedAudio(const QString &path, drift::TimeUs srcIn
         const double base = 0.25 + 0.35 * ch;
         const std::vector<float> clean = dn.denoise(mono, [&](double f) {
             setProgress(span01(base + 0.35 * f),
-                        ch == 0 ? QStringLiteral("Removing noise (left)…")
-                                : QStringLiteral("Removing noise (right)…"));
+                        ch == 0 ? tr("Removing noise (left)…")
+                                : tr("Removing noise (right)…"));
             return m_denoiseCancel.loadRelaxed() == 0;
         });
         if (clean.empty()) {
-            return fail(m_denoiseCancel.loadRelaxed() ? QStringLiteral("Noise removal cancelled")
+            return fail(m_denoiseCancel.loadRelaxed() ? tr("Noise removal cancelled")
                                                       : dn.lastError());
         }
         for (int64_t i = 0; i < have; ++i)
             interleaved[size_t(i) * 2 + ch] = clean[size_t(i)];
     }
 
-    setProgress(span01(0.95), QStringLiteral("Writing audio…"));
+    setProgress(span01(0.95), tr("Writing audio…"));
     drift::AudioFileWriter writer;
     QString error;
     if (!writer.open(outPath, rate, 2, &error))
@@ -4781,7 +4914,7 @@ bool AppController::renderDenoisedAudio(const QString &path, drift::TimeUs srcIn
 void AppController::previewDenoise(int trackIndex, int clipIndex, double atSeconds)
 {
     if (m_denoising) {
-        setLastMessage(QStringLiteral("Noise removal already in progress"), QStringLiteral("warning"));
+        setLastMessage(tr("Noise removal already in progress"), QStringLiteral("warning"));
         return;
     }
     if (trackIndex < 0 || trackIndex >= m_project.tracks().size())
@@ -4792,11 +4925,11 @@ void AppController::previewDenoise(int trackIndex, int clipIndex, double atSecon
 
     const drift::Clip clip = track.clips.at(clipIndex);
     if (clip.type != drift::ClipType::Audio && clip.type != drift::ClipType::Video) {
-        setLastMessage(QStringLiteral("Select a video or audio clip"), QStringLiteral("warning"));
+        setLastMessage(tr("Select a video or audio clip"), QStringLiteral("warning"));
         return;
     }
     if (clip.path.isEmpty() || clip.srcOut <= clip.srcIn) {
-        setLastMessage(QStringLiteral("Clip has no audio"), QStringLiteral("warning"));
+        setLastMessage(tr("Clip has no audio"), QStringLiteral("warning"));
         return;
     }
 
@@ -4817,7 +4950,7 @@ void AppController::previewDenoise(int trackIndex, int clipIndex, double atSecon
     m_denoiseCancel.storeRelaxed(0);
     m_denoiseProgress = 0.0;
     emit denoiseProgressChanged();
-    m_denoiseStatus = QStringLiteral("Starting…");
+    m_denoiseStatus = tr("Starting…");
     emit denoiseStatusChanged();
     m_denoising = true;
     emit denoisingChanged();
@@ -4828,7 +4961,7 @@ void AppController::previewDenoise(int trackIndex, int clipIndex, double atSecon
     if (cleanPath.isEmpty() || origPath.isEmpty()) {
         m_denoising = false;
         emit denoisingChanged();
-        setLastMessage(QStringLiteral("Could not create a preview file"), QStringLiteral("error"));
+        setLastMessage(tr("Could not create a preview file"), QStringLiteral("error"));
         return;
     }
 
@@ -4842,7 +4975,7 @@ void AppController::previewDenoise(int trackIndex, int clipIndex, double atSecon
                 emit denoisingChanged();
                 m_denoiseProgress = ok ? 1.0 : 0.0;
                 emit denoiseProgressChanged();
-                m_denoiseStatus = ok ? QStringLiteral("Ready") : error;
+                m_denoiseStatus = ok ? tr("Ready") : error;
                 emit denoiseStatusChanged();
                 if (!ok) {
                     QFile::remove(cleanPath);
@@ -4867,7 +5000,7 @@ void AppController::previewDenoise(int trackIndex, int clipIndex, double atSecon
 void AppController::applyDenoise(int trackIndex, int clipIndex)
 {
     if (m_denoising) {
-        setLastMessage(QStringLiteral("Noise removal already in progress"), QStringLiteral("warning"));
+        setLastMessage(tr("Noise removal already in progress"), QStringLiteral("warning"));
         return;
     }
     if (trackIndex < 0 || trackIndex >= m_project.tracks().size())
@@ -4878,11 +5011,11 @@ void AppController::applyDenoise(int trackIndex, int clipIndex)
 
     const drift::Clip clip = track.clips.at(clipIndex);
     if (clip.type != drift::ClipType::Audio && clip.type != drift::ClipType::Video) {
-        setLastMessage(QStringLiteral("Select a video or audio clip"), QStringLiteral("warning"));
+        setLastMessage(tr("Select a video or audio clip"), QStringLiteral("warning"));
         return;
     }
     if (clip.path.isEmpty() || clip.srcOut <= clip.srcIn) {
-        setLastMessage(QStringLiteral("Clip has no audio"), QStringLiteral("warning"));
+        setLastMessage(tr("Clip has no audio"), QStringLiteral("warning"));
         return;
     }
 
@@ -4891,11 +5024,11 @@ void AppController::applyDenoise(int trackIndex, int clipIndex)
     m_denoiseCancel.storeRelaxed(0);
     m_denoiseProgress = 0.0;
     emit denoiseProgressChanged();
-    m_denoiseStatus = QStringLiteral("Starting…");
+    m_denoiseStatus = tr("Starting…");
     emit denoiseStatusChanged();
     m_denoising = true;
     emit denoisingChanged();
-    setLastMessage(QStringLiteral("Removing noise..."));
+    setLastMessage(tr("Removing noise…"));
 
     const QString path = clip.path;
     const drift::TimeUs srcIn = clip.srcIn;
@@ -4907,7 +5040,7 @@ void AppController::applyDenoise(int trackIndex, int clipIndex)
     if (outPath.isEmpty()) {
         m_denoising = false;
         emit denoisingChanged();
-        setLastMessage(QStringLiteral("Could not create an output file"), QStringLiteral("error"));
+        setLastMessage(tr("Could not create an output file"), QStringLiteral("error"));
         return;
     }
 
@@ -4921,7 +5054,7 @@ void AppController::applyDenoise(int trackIndex, int clipIndex)
                 emit denoisingChanged();
                 m_denoiseProgress = ok ? 1.0 : 0.0;
                 emit denoiseProgressChanged();
-                m_denoiseStatus = ok ? QStringLiteral("Done") : error;
+                m_denoiseStatus = ok ? tr("Done") : error;
                 emit denoiseStatusChanged();
                 if (!ok) {
                     QFile::remove(outPath);
@@ -4975,18 +5108,18 @@ void AppController::finalizeDenoise(const QString &clipId, const QString &audioP
     clip.mask = drift::Mask{};
     clip.srcIn = 0;
     clip.srcOut = source.srcOut - source.srcIn;
-    clip.name = (source.name.isEmpty() ? QStringLiteral("Clip") : source.name)
-                + QStringLiteral(" (denoised)");
+    clip.name = (source.name.isEmpty() ? tr("Clip") : source.name)
+                + tr(" (denoised)");
 
     const int newTrack =
         drift::insertTrackAboveForClipType(m_project, trackIndex, drift::ClipType::Audio);
     m_project.tracks()[newTrack].clips.append(clip);
 
-    pushProjectEdit(before, QStringLiteral("Remove noise"));
-    finishEdit(QStringLiteral("Noise removed"));
+    pushProjectEdit(before, tr("Remove noise"));
+    finishEdit(tr("Noise removed"));
     selectClip(newTrack, m_project.tracks().at(newTrack).clips.size() - 1);
-    setLastMessage(QStringLiteral("Noise removed"), QStringLiteral("success"));
-    emit denoiseFinished(true, QStringLiteral("Noise removed"));
+    setLastMessage(tr("Noise removed"), QStringLiteral("success"));
+    emit denoiseFinished(true, tr("Noise removed"));
 }
 
 void AppController::finalizeGeneratedSubtitles(drift::TimeUs timelineStart,
@@ -5015,10 +5148,10 @@ void AppController::finalizeGeneratedSubtitles(drift::TimeUs timelineStart,
     clip.name = drift::subtitleClipName(cues);
 
     track.clips.append(clip);
-    pushProjectEdit(before, QStringLiteral("Subtitles generated"));
-    finishEdit(QStringLiteral("Subtitles generated"));
+    pushProjectEdit(before, tr("Subtitles generated"));
+    finishEdit(tr("Subtitles generated"));
     selectClip(trackIndex, track.clips.size() - 1);
-    setLastMessage(QStringLiteral("Subtitles generated"), QStringLiteral("success"));
+    setLastMessage(tr("Subtitles generated"), QStringLiteral("success"));
     emit subtitleGenerationFinished(true, QStringLiteral("Subtitles generated"));
 }
 
@@ -5050,12 +5183,12 @@ void AppController::reportMissingCatalogEntries()
     const QString sample = names.mid(0, 3).join(QStringLiteral(", "));
 
     setLastMessage(total == 1
-                       ? QStringLiteral("This project uses \"%1\", which isn’t installed — it "
-                                        "won’t show. Open Extras to install it.").arg(sample)
-                       : QStringLiteral("This project uses %1 effects or transitions that aren’t "
-                                        "installed (%2%3) — they won’t show. Open Extras to install them.")
+                       ? tr("This project uses \"%1\", which isn’t installed — it "
+                            "won’t show. Open Extras to install it.").arg(sample)
+                       : tr("This project uses %1 effects or transitions that aren’t "
+                            "installed (%2%3) — they won’t show. Open Extras to install them.")
                              .arg(total)
-                             .arg(sample, names.size() > 3 ? QStringLiteral(", …") : QString()));
+                             .arg(sample, names.size() > 3 ? tr(", …") : QString()));
 }
 
 QVariantList AppController::builtinStickers() const
@@ -5169,8 +5302,8 @@ void AppController::addShapeClipAt(const QString &shapeId, int trackIndex, doubl
                              entry ? entry->aspect : 1.6);
 
     track.clips.append(clip);
-    pushProjectEdit(before, QStringLiteral("Shape added"));
-    finishEdit(QStringLiteral("Shape added"));
+    pushProjectEdit(before, tr("Shape added"));
+    finishEdit(tr("Shape added"));
     selectClip(target, track.clips.size() - 1);
 }
 
@@ -5221,7 +5354,7 @@ void AppController::addEmojiClip(const QString &emoji, const QString &name, doub
 {
     const QString path = emojiImagePath(emoji);
     if (path.isEmpty()) {
-        setLastMessage(QStringLiteral("Install the emoji sticker pack to add emoji"), QStringLiteral("warning"));
+        setLastMessage(tr("Install the emoji sticker pack to add emoji"), QStringLiteral("warning"));
         return;
     }
     addImageOverlayClip(path, name.isEmpty() ? emoji : name, emoji, atSeconds,
@@ -5351,8 +5484,8 @@ void AppController::setProjectSetup(int width, int height, int fps)
     m_project.setResolution(width, height);
     m_project.setFps(fps);
     if (!pristine)
-        pushProjectEdit(before, QStringLiteral("Project setup"));
-    finishEdit(QStringLiteral("Project setup updated"));
+        pushProjectEdit(before, tr("Project setup"));
+    finishEdit(tr("Project setup updated"));
 }
 
 // Crop rect is given in current-canvas pixels; it may extend outside the canvas
@@ -5368,7 +5501,7 @@ void AppController::applyCanvasCrop(double x, double y, double width, double hei
     const drift::Project before = m_project;
     drift::rebaseClipLayout(m_project, m_project.width(), m_project.height(), x, y);
     m_project.setResolution(newWidth, newHeight);
-    pushProjectEdit(before, QStringLiteral("Crop canvas"));
+    pushProjectEdit(before, tr("Crop canvas"));
     finishEdit(tr("Video size cropped to %1×%2").arg(newWidth).arg(newHeight));
 }
 
@@ -5414,8 +5547,8 @@ void AppController::setBackground(const QVariantMap &background)
 
     const drift::Project before = m_project;
     m_project.setBackground(bg);
-    pushProjectEdit(before, QStringLiteral("Change background"));
-    finishEdit(QStringLiteral("Background updated"));
+    pushProjectEdit(before, tr("Change background"));
+    finishEdit(tr("Background updated"));
     emit backgroundChanged();
     emitPreviewFrame();
 }
@@ -5517,7 +5650,7 @@ void AppController::beginPreviewDrag(const QString &undoText)
 {
     m_previewDragBefore = m_project;
     m_previewDragActive = true;
-    m_previewDragText = undoText.isEmpty() ? QStringLiteral("Edit clip") : undoText;
+    m_previewDragText = undoText.isEmpty() ? tr("Edit clip") : undoText;
 }
 
 void AppController::emitPreviewFrame()
@@ -5548,7 +5681,7 @@ void AppController::previewSetClipPosition(int trackIndex, int clipIndex, double
     }
 
     if (!m_previewDragActive)
-        beginPreviewDrag(QStringLiteral("Move clip"));
+        beginPreviewDrag(tr("Move clip"));
 
     emitPreviewFrame();
 }
@@ -5574,7 +5707,7 @@ void AppController::previewSetClipSize(int trackIndex, int clipIndex, double wid
     }
 
     if (!m_previewDragActive)
-        beginPreviewDrag(QStringLiteral("Resize clip"));
+        beginPreviewDrag(tr("Resize clip"));
 
     emitPreviewFrame();
 }
@@ -5604,7 +5737,7 @@ void AppController::previewSetClipRect(int trackIndex, int clipIndex, double xPi
     }
 
     if (!m_previewDragActive)
-        beginPreviewDrag(QStringLiteral("Transform clip"));
+        beginPreviewDrag(tr("Transform clip"));
 
     emitPreviewFrame();
 }
@@ -5626,7 +5759,7 @@ void AppController::previewSetClipRotation(int trackIndex, int clipIndex, double
     }
 
     if (!m_previewDragActive)
-        beginPreviewDrag(QStringLiteral("Rotate clip"));
+        beginPreviewDrag(tr("Rotate clip"));
 
     emitPreviewFrame();
 }
@@ -5649,7 +5782,7 @@ void AppController::previewSetClipKeyframe(int trackIndex, int clipIndex, const 
     }
 
     if (!m_previewDragActive)
-        beginPreviewDrag(QStringLiteral("Edit keyframe"));
+        beginPreviewDrag(tr("Edit keyframe"));
 
     emitPreviewFrame();
 }
@@ -5671,7 +5804,7 @@ void AppController::previewSetEffectParam(int trackIndex, int clipIndex, int eff
         return;
 
     if (!m_previewDragActive)
-        beginPreviewDrag(QStringLiteral("Edit effect"));
+        beginPreviewDrag(tr("Edit effect"));
 
     const EffectPresetEntry *def = effectDefForId(clip.effects[effectIndex].catalogId);
     bool asBoolean = false;
@@ -5704,7 +5837,7 @@ void AppController::previewSetClipSpeed(int trackIndex, int clipIndex, double sp
         return;
 
     if (!m_previewDragActive)
-        beginPreviewDrag(QStringLiteral("Speed changed"));
+        beginPreviewDrag(tr("Speed changed"));
 
     clip.speed = qBound(0.25, speed, 4.0);
     clip.syncSrcOutFromSpeed(sourceDurationForClip(clip));
@@ -5722,7 +5855,7 @@ void AppController::previewSetClipFade(int trackIndex, int clipIndex, double fad
         return;
 
     if (!m_previewDragActive)
-        beginPreviewDrag(QStringLiteral("Adjust fade"));
+        beginPreviewDrag(tr("Adjust fade"));
 
     drift::Clip &clip = track.clips[clipIndex];
     drift::TimeUs fin = qMax<drift::TimeUs>(0, drift::secondsToUs(fadeInSeconds));
@@ -5763,7 +5896,7 @@ void AppController::previewSetClipMask(int trackIndex, int clipIndex, const QVar
         return;
 
     if (!m_previewDragActive)
-        beginPreviewDrag(QStringLiteral("Mask changed"));
+        beginPreviewDrag(tr("Mask changed"));
 
     track.clips[clipIndex].mask = maskFromMap(maskMap);
     emitPreviewFrame();
@@ -5774,8 +5907,9 @@ void AppController::commitPreviewDrag()
     if (!m_previewDragActive)
         return;
 
-    const QString text = m_previewDragText.isEmpty() ? QStringLiteral("Edit clip") : m_previewDragText;
-    m_undoStack.push(new drift::ProjectSnapshotCommand(&m_project, m_previewDragBefore, m_project, text));
+    const QString text = m_previewDragText.isEmpty() ? tr("Edit clip") : m_previewDragText;
+    if (!m_mcpUndoSuspended)
+        m_undoStack.push(new drift::ProjectSnapshotCommand(&m_project, m_previewDragBefore, m_project, text));
     m_previewDragActive = false;
     finishEdit(text);
 }
@@ -5806,8 +5940,8 @@ void AppController::setClipStart(int trackIndex, int clipIndex, double start)
                                                  clip.timelineDuration, m_snapEnabled, m_playheadUs,
                                                  extraSnapTargets());
     applyRippleShift(track, clipIndex, clip.timelineStart - oldStart);
-    pushProjectEdit(before, QStringLiteral("Start updated"));
-    finishEdit(QStringLiteral("Start updated"));
+    pushProjectEdit(before, tr("Start updated"));
+    finishEdit(tr("Start updated"));
 }
 
 void AppController::setClipDuration(int trackIndex, int clipIndex, double duration)
@@ -5843,8 +5977,8 @@ void AppController::setClipDuration(int trackIndex, int clipIndex, double durati
         else
             clip.srcOut = qMin(clip.srcIn + span, maxSource);
     }
-    pushProjectEdit(before, QStringLiteral("Duration updated"));
-    finishEdit(QStringLiteral("Duration updated"));
+    pushProjectEdit(before, tr("Duration updated"));
+    finishEdit(tr("Duration updated"));
 }
 
 void AppController::setClipTextContent(int trackIndex, int clipIndex, const QString &text)
@@ -5863,8 +5997,8 @@ void AppController::setClipTextContent(int trackIndex, int clipIndex, const QStr
     const drift::Project before = m_project;
     clip.textContent = text.trimmed();
     clip.name = clip.textContent.left(32);
-    pushProjectEdit(before, QStringLiteral("Text updated"));
-    finishEdit(QStringLiteral("Text updated"));
+    pushProjectEdit(before, tr("Text updated"));
+    finishEdit(tr("Text updated"));
 }
 
 void AppController::setClipName(int trackIndex, int clipIndex, const QString &name)
@@ -5888,8 +6022,8 @@ void AppController::setClipName(int trackIndex, int clipIndex, const QString &na
     // copy can still alias those payloads across undo snapshots; detach first.
     const drift::Project before = m_project.detachedCopy();
     clip.name = trimmed;
-    pushProjectEdit(before, QStringLiteral("Rename clip"));
-    finishEdit(QStringLiteral("Clip renamed"));
+    pushProjectEdit(before, tr("Rename clip"));
+    finishEdit(tr("Clip renamed"));
 }
 
 void AppController::previewSetClipTextContent(int trackIndex, int clipIndex, const QString &text)
@@ -5912,7 +6046,7 @@ void AppController::previewSetClipTextContent(int trackIndex, int clipIndex, con
     clip.name = text.left(32);
 
     if (!m_previewDragActive)
-        beginPreviewDrag(QStringLiteral("Edit text"));
+        beginPreviewDrag(tr("Edit text"));
 
     emitPreviewFrame();
 }
@@ -5944,8 +6078,8 @@ void AppController::commitTextEdit(int trackIndex, int clipIndex, const QString 
     const drift::Project before = m_project;
     clip.textContent = trimmed;
     clip.name = trimmed.left(32);
-    pushProjectEdit(before, QStringLiteral("Text updated"));
-    finishEdit(QStringLiteral("Text updated"));
+    pushProjectEdit(before, tr("Text updated"));
+    finishEdit(tr("Text updated"));
 }
 
 void AppController::beginTextEdit(int trackIndex, int clipIndex)
@@ -5959,7 +6093,7 @@ void AppController::beginTextEdit(int trackIndex, int clipIndex)
         return;
 
     if (!m_previewDragActive)
-        beginPreviewDrag(QStringLiteral("Edit text"));
+        beginPreviewDrag(tr("Edit text"));
 
     // Hide this clip from the composited frame; the QML inline editor stands in
     // for it while the user types. Committing goes through commitTextEdit.
@@ -6012,8 +6146,8 @@ void AppController::setSubtitleCues(int trackIndex, int clipIndex, const QVarian
     const drift::Project before = m_project;
     clip.subtitleCues = subtitleCuesFromMap(cues);
     clip.name = drift::subtitleClipName(clip.subtitleCues);
-    pushProjectEdit(before, QStringLiteral("Subtitles updated"));
-    finishEdit(QStringLiteral("Subtitles updated"));
+    pushProjectEdit(before, tr("Subtitles updated"));
+    finishEdit(tr("Subtitles updated"));
 }
 
 void AppController::previewSetSubtitleCues(int trackIndex, int clipIndex, const QVariantList &cues)
@@ -6030,7 +6164,7 @@ void AppController::previewSetSubtitleCues(int trackIndex, int clipIndex, const 
         return;
 
     if (!m_previewDragActive)
-        beginPreviewDrag(QStringLiteral("Adjust subtitle timing"));
+        beginPreviewDrag(tr("Adjust subtitle timing"));
 
     clip.subtitleCues = subtitleCuesFromMap(cues);
     clip.name = drift::subtitleClipName(clip.subtitleCues);
@@ -6096,8 +6230,8 @@ void AppController::upsertSubtitleCueAtPlayhead(int trackIndex, int clipIndex, c
     }
 
     clip.name = drift::subtitleClipName(clip.subtitleCues);
-    pushProjectEdit(before, QStringLiteral("Subtitle cue updated"));
-    finishEdit(QStringLiteral("Subtitle cue updated"));
+    pushProjectEdit(before, tr("Subtitle cue updated"));
+    finishEdit(tr("Subtitle cue updated"));
 }
 
 void AppController::seekToSubtitleCue(int trackIndex, int clipIndex, int cueIndex)
@@ -6207,8 +6341,8 @@ void AppController::setTextStyle(int trackIndex, int clipIndex, const QVariantMa
             break;
         }
     }
-    pushProjectEdit(before, QStringLiteral("Edit text style"));
-    finishEdit(QStringLiteral("Text style updated"));
+    pushProjectEdit(before, tr("Edit text style"));
+    finishEdit(tr("Text style updated"));
 }
 
 void AppController::applyTextPreset(int trackIndex, int clipIndex, const QString &presetId)
@@ -6231,8 +6365,8 @@ void AppController::applyTextPreset(int trackIndex, int clipIndex, const QString
     const drift::Project before = m_project;
     clip.textStyle = *preset;
     clip.textStyle.packId = presetId;
-    pushProjectEdit(before, QStringLiteral("Apply text preset"));
-    finishEdit(QStringLiteral("Text preset applied"));
+    pushProjectEdit(before, tr("Apply text preset"));
+    finishEdit(tr("Text preset applied"));
 }
 
 QVariantList AppController::textPresets() const
@@ -6321,7 +6455,7 @@ void AppController::previewSetTextRect(int trackIndex, int clipIndex, double xPi
         return;
 
     if (!m_previewDragActive)
-        beginPreviewDrag(QStringLiteral("Resize text"));
+        beginPreviewDrag(tr("Resize text"));
 
     emitPreviewFrame();
 }
@@ -6337,8 +6471,8 @@ void AppController::setClipBlendMode(int trackIndex, int clipIndex, const QStrin
 
     const drift::Project before = m_project;
     track.clips[clipIndex].blendMode = drift::blendModeFromString(mode);
-    pushProjectEdit(before, QStringLiteral("Blend mode changed"));
-    finishEdit(QStringLiteral("Blend mode updated"));
+    pushProjectEdit(before, tr("Blend mode changed"));
+    finishEdit(tr("Blend mode updated"));
 }
 
 void AppController::setClipSpeed(int trackIndex, int clipIndex, double speed)
@@ -6358,8 +6492,8 @@ void AppController::setClipSpeed(int trackIndex, int clipIndex, double speed)
     clip.speed = qBound(0.25, speed, 4.0);
     clip.syncSrcOutFromSpeed(sourceDurationForClip(clip));
     syncLinkedPartnersFrom(m_project, clip);
-    pushProjectEdit(before, QStringLiteral("Speed changed"));
-    finishEdit(QStringLiteral("Clip speed updated"));
+    pushProjectEdit(before, tr("Speed changed"));
+    finishEdit(tr("Clip speed updated"));
 }
 
 void AppController::setClipReverse(int trackIndex, int clipIndex, bool reverse)
@@ -6379,8 +6513,8 @@ void AppController::setClipReverse(int trackIndex, int clipIndex, bool reverse)
 
     const drift::Project before = m_project;
     clip.reverse = reverse;
-    pushProjectEdit(before, reverse ? QStringLiteral("Reverse on") : QStringLiteral("Reverse off"));
-    finishEdit(reverse ? QStringLiteral("Clip reversed") : QStringLiteral("Clip forward"));
+    pushProjectEdit(before, reverse ? tr("Reverse on") : tr("Reverse off"));
+    finishEdit(reverse ? tr("Clip reversed") : tr("Clip forward"));
 }
 
 void AppController::requestClipReverse(int trackIndex, int clipIndex)
@@ -6409,7 +6543,7 @@ void AppController::requestClipReverse(int trackIndex, int clipIndex)
 void AppController::applyClipReverse(int trackIndex, int clipIndex)
 {
     if (m_reverseRendering) {
-        setLastMessage(QStringLiteral("A clip is already being reversed"), QStringLiteral("warning"));
+        setLastMessage(tr("A clip is already being reversed"), QStringLiteral("warning"));
         return;
     }
     if (trackIndex < 0 || trackIndex >= m_project.tracks().size())
@@ -6501,14 +6635,14 @@ void AppController::startReverseRender(const QString &sourcePath, drift::TimeUs 
 
         const QString proxyPath = drift::newReversePath();
         if (proxyPath.isEmpty()) {
-            finish(false, QStringLiteral("Could not create a reversed file"), {});
+            finish(false, tr("Could not create a reversed file"), {});
             return;
         }
 
         QString error;
         const bool ok = drift::renderReversed(
             sourcePath, coverInUs, coverOutUs, proxyPath, &error, [&](double fraction) {
-                setProgress(fraction, QStringLiteral("Reversing video…"));
+                setProgress(fraction, tr("Reversing video…"));
                 return m_reverseCancel.loadRelaxed() == 0;
             });
         finish(ok, ok ? QStringLiteral("Reversed clip ready") : error, proxyPath);
@@ -6557,8 +6691,8 @@ void AppController::setClipFlip(int trackIndex, int clipIndex, bool flipH, bool 
     const drift::Project before = m_project;
     clip.flipH = flipH;
     clip.flipV = flipV;
-    pushProjectEdit(before, QStringLiteral("Flip changed"));
-    finishEdit(QStringLiteral("Clip flip updated"));
+    pushProjectEdit(before, tr("Flip changed"));
+    finishEdit(tr("Clip flip updated"));
 }
 
 void AppController::setClipRotationSnap(int trackIndex, int clipIndex, double degrees)
@@ -6586,8 +6720,8 @@ void AppController::setClipRotationSnap(int trackIndex, int clipIndex, double de
     // chips and preview stay in lockstep (no leftover mid-curve keys).
     clip.rotation = {};
     clip.rotation.setKeyframe(0, snapped);
-    pushProjectEdit(before, QStringLiteral("Rotation snapped"));
-    finishEdit(QStringLiteral("Rotation set to %1°").arg(snapped, 0, 'f', 0));
+    pushProjectEdit(before, tr("Rotation snapped"));
+    finishEdit(tr("Rotation set to %1°").arg(snapped, 0, 'f', 0));
 }
 
 bool AppController::canMergeSelection() const
@@ -6700,8 +6834,8 @@ void AppController::mergeSelectedClips()
         leftIndex = rightIndex;
     }
 
-    pushProjectEdit(before, QStringLiteral("Clips merged"));
-    finishEdit(QStringLiteral("Clips merged"));
+    pushProjectEdit(before, tr("Clips merged"));
+    finishEdit(tr("Clips merged"));
     selectClip(trackIndex, leftIndex);
 }
 
@@ -6766,8 +6900,8 @@ void AppController::separateAudioFromSelection()
     if (m_selectedTrack >= 0 && m_selectedClip >= 0)
         m_selection = selectionWithLinkedPartners(m_project, m_selectedTrack, m_selectedClip);
 
-    pushProjectEdit(before, QStringLiteral("Audio separated"));
-    finishEdit(QStringLiteral("Audio separated"));
+    pushProjectEdit(before, tr("Audio separated"));
+    finishEdit(tr("Audio separated"));
 }
 
 void AppController::unlinkSelectedClips()
@@ -6805,8 +6939,8 @@ void AppController::unlinkSelectedClips()
     if (m_selectedTrack >= 0 && m_selectedClip >= 0)
         m_selection = {qMakePair(m_selectedTrack, m_selectedClip)};
 
-    pushProjectEdit(before, QStringLiteral("Clips unlinked"));
-    finishEdit(QStringLiteral("Audio unlinked"));
+    pushProjectEdit(before, tr("Clips unlinked"));
+    finishEdit(tr("Audio unlinked"));
 }
 
 void AppController::setClipFade(int trackIndex, int clipIndex, double fadeInSeconds, double fadeOutSeconds)
@@ -6857,8 +6991,8 @@ void AppController::setClipFade(int trackIndex, int clipIndex, double fadeInSeco
     }
 
     syncLinkedPartnersFrom(m_project, clip);
-    pushProjectEdit(before, QStringLiteral("Fade updated"));
-    finishEdit(QStringLiteral("Fade updated"));
+    pushProjectEdit(before, tr("Fade updated"));
+    finishEdit(tr("Fade updated"));
 }
 
 void AppController::setClipFadeCurve(int trackIndex, int clipIndex, const QString &curve)
@@ -6892,8 +7026,8 @@ void AppController::setClipFadeCurve(int trackIndex, int clipIndex, const QStrin
         clip.animOut.ease = drift::clipAnimCurveToEase(newCurve);
     }
     syncLinkedPartnersFrom(m_project, clip);
-    pushProjectEdit(before, QStringLiteral("Fade curve changed"));
-    finishEdit(QStringLiteral("Fade curve updated"));
+    pushProjectEdit(before, tr("Fade curve changed"));
+    finishEdit(tr("Fade curve updated"));
 }
 
 void AppController::setClipAnimation(int trackIndex, int clipIndex, const QString &which,
@@ -6969,8 +7103,8 @@ void AppController::setClipAnimation(int trackIndex, int clipIndex, const QStrin
         }
     }
 
-    pushProjectEdit(before, QStringLiteral("Clip animation changed"));
-    finishEdit(QStringLiteral("Clip animation updated"));
+    pushProjectEdit(before, tr("Clip animation changed"));
+    finishEdit(tr("Clip animation updated"));
 }
 
 void AppController::setShapeStyle(int trackIndex, int clipIndex, const QVariantMap &m)
@@ -7032,8 +7166,8 @@ void AppController::setShapeStyle(int trackIndex, int clipIndex, const QVariantM
         return;
     }
 
-    pushProjectEdit(before, QStringLiteral("Shape style changed"));
-    finishEdit(QStringLiteral("Shape style updated"));
+    pushProjectEdit(before, tr("Shape style changed"));
+    finishEdit(tr("Shape style updated"));
 }
 
 void AppController::setClipMask(int trackIndex, int clipIndex, const QVariantMap &maskMap)
@@ -7047,8 +7181,8 @@ void AppController::setClipMask(int trackIndex, int clipIndex, const QVariantMap
 
     const drift::Project before = m_project;
     track.clips[clipIndex].mask = maskFromMap(maskMap);
-    pushProjectEdit(before, QStringLiteral("Mask changed"));
-    finishEdit(QStringLiteral("Clip mask updated"));
+    pushProjectEdit(before, tr("Mask changed"));
+    finishEdit(tr("Clip mask updated"));
 }
 
 void AppController::addTransition(int trackIndex, int clipIndex, const QString &kind, double durationSeconds)
@@ -7077,8 +7211,8 @@ void AppController::addTransition(int trackIndex, int clipIndex, const QString &
             existing.kindId = kindId;
             existing.parameters.clear(); // overrides belong to the old package
             existing.durationUs = durationUs;
-            pushProjectEdit(before, QStringLiteral("Replace transition"));
-            finishEdit(QStringLiteral("Transition updated"));
+            pushProjectEdit(before, tr("Replace transition"));
+            finishEdit(tr("Transition updated"));
             selectTransition(trackIndex, clipIndex);
             return;
         }
@@ -7093,8 +7227,8 @@ void AppController::addTransition(int trackIndex, int clipIndex, const QString &
 
     const drift::Project before = m_project;
     track.transitions.append(transition);
-    pushProjectEdit(before, QStringLiteral("Add transition"));
-    finishEdit(QStringLiteral("Transition added"));
+    pushProjectEdit(before, tr("Add transition"));
+    finishEdit(tr("Transition added"));
     selectTransition(trackIndex, clipIndex);
 }
 
@@ -7129,8 +7263,8 @@ void AppController::removeTransition(int trackIndex, const QString &transitionId
             toClip->timelineStart = fromClip->timelineEnd();
 
         track.transitions.removeAt(i);
-        pushProjectEdit(before, QStringLiteral("Remove transition"));
-        finishEdit(QStringLiteral("Transition removed"));
+        pushProjectEdit(before, tr("Remove transition"));
+        finishEdit(tr("Transition removed"));
         return;
     }
 }
@@ -7167,8 +7301,8 @@ void AppController::setTransitionDuration(int trackIndex, const QString &transit
             transition.durationUs = durationUs;
         }
 
-        pushProjectEdit(before, QStringLiteral("Transition duration"));
-        finishEdit(QStringLiteral("Transition duration updated"));
+        pushProjectEdit(before, tr("Transition duration"));
+        finishEdit(tr("Transition duration updated"));
         emit selectedTransitionDataChanged();
         return;
     }
@@ -7189,8 +7323,8 @@ void AppController::setTransitionKind(int trackIndex, const QString &transitionI
                 return;
             transition.kindId = kind;
             transition.parameters.clear(); // overrides belong to the old package
-            pushProjectEdit(before, QStringLiteral("Transition kind"));
-            finishEdit(QStringLiteral("Transition kind updated"));
+            pushProjectEdit(before, tr("Transition kind"));
+            finishEdit(tr("Transition kind updated"));
             emit selectedTransitionDataChanged();
             return;
         }
@@ -7233,7 +7367,7 @@ void AppController::previewSetTransitionParam(int trackIndex, const QString &tra
         return;
 
     if (!m_previewDragActive)
-        beginPreviewDrag(QStringLiteral("Edit transition"));
+        beginPreviewDrag(tr("Edit transition"));
 
     transition->parameters.insert(
         key, coerceTransitionParam(transitionDefForId(transition->kindId), key, value));
@@ -7254,8 +7388,8 @@ void AppController::setTransitionParam(int trackIndex, const QString &transition
     const drift::Project before = m_project;
     transition->parameters.insert(
         key, coerceTransitionParam(transitionDefForId(transition->kindId), key, value));
-    pushProjectEdit(before, QStringLiteral("Edit transition"));
-    finishEdit(QStringLiteral("Transition updated"));
+    pushProjectEdit(before, tr("Edit transition"));
+    finishEdit(tr("Transition updated"));
     emit selectedTransitionDataChanged();
 }
 
@@ -7367,8 +7501,8 @@ void AppController::setClipKeyframe(int trackIndex, int clipIndex, const QString
     const drift::TimeUs rel = qMax<drift::TimeUs>(0, drift::secondsToUs(atSeconds) - clip.timelineStart);
     if (!writeClipPropValue(clip, prop, rel, value, m_autoKeyEnabled, /*force=*/true))
         return;
-    pushProjectEdit(before, QStringLiteral("Add keyframe"));
-    finishEdit(QStringLiteral("Keyframe set"));
+    pushProjectEdit(before, tr("Add keyframe"));
+    finishEdit(tr("Keyframe set"));
 }
 
 void AppController::removeClipKeyframe(int trackIndex, int clipIndex, const QString &prop, double atSeconds)
@@ -7391,8 +7525,8 @@ void AppController::removeClipKeyframe(int trackIndex, int clipIndex, const QStr
     if (nearest < 0)
         return;
     kt->removeKeyframe(nearest);
-    pushProjectEdit(before, QStringLiteral("Remove keyframe"));
-    finishEdit(QStringLiteral("Keyframe removed"));
+    pushProjectEdit(before, tr("Remove keyframe"));
+    finishEdit(tr("Keyframe removed"));
 }
 
 void AppController::previewMoveClipKeyframe(int trackIndex, int clipIndex, const QString &prop,
@@ -7411,7 +7545,7 @@ void AppController::previewMoveClipKeyframe(int trackIndex, int clipIndex, const
         return;
 
     if (!m_previewDragActive)
-        beginPreviewDrag(QStringLiteral("Move keyframe"));
+        beginPreviewDrag(tr("Move keyframe"));
 
     const drift::TimeUs fromRel = qMax<drift::TimeUs>(0, drift::secondsToUs(fromSeconds) - clip.timelineStart);
     const drift::TimeUs toRel = qMax<drift::TimeUs>(0, drift::secondsToUs(toSeconds) - clip.timelineStart);
@@ -7575,9 +7709,9 @@ void AppController::setClipPropertyKeyframesEnabled(int trackIndex, int clipInde
     const drift::Project before = m_project;
     drift::Clip &clip = m_project.tracks()[trackIndex].clips[clipIndex];
     keyframeTrackForProp(clip, prop, /*createIfMissing=*/false)->setEnabled(enabled);
-    pushProjectEdit(before, enabled ? QStringLiteral("Enable keyframes")
-                                    : QStringLiteral("Disable keyframes"));
-    finishEdit(enabled ? QStringLiteral("Keyframes enabled") : QStringLiteral("Keyframes disabled"));
+    pushProjectEdit(before, enabled ? tr("Enable keyframes")
+                                    : tr("Disable keyframes"));
+    finishEdit(enabled ? tr("Keyframes enabled") : tr("Keyframes disabled"));
 }
 
 void AppController::toggleClipPropertyKeyframesEnabled(int trackIndex, int clipIndex,
@@ -7652,8 +7786,8 @@ void AppController::setKeyframeInterpolation(int trackIndex, int clipIndex, cons
 
     const drift::Project before = m_project;
     kt->setEasing(at, drift::interpolationFromString(mode));
-    pushProjectEdit(before, QStringLiteral("Keyframe easing changed"));
-    finishEdit(QStringLiteral("Keyframe easing updated"));
+    pushProjectEdit(before, tr("Keyframe easing changed"));
+    finishEdit(tr("Keyframe easing updated"));
 }
 
 void AppController::setKeyframeTangents(int trackIndex, int clipIndex, const QString &prop,
@@ -7666,8 +7800,8 @@ void AppController::setKeyframeTangents(int trackIndex, int clipIndex, const QSt
 
     const drift::Project before = m_project;
     applyTangents(*key, inDx, inDy, outDx, outDy, corner);
-    pushProjectEdit(before, QStringLiteral("Keyframe curve changed"));
-    finishEdit(QStringLiteral("Keyframe curve updated"));
+    pushProjectEdit(before, tr("Keyframe curve changed"));
+    finishEdit(tr("Keyframe curve updated"));
 }
 
 void AppController::previewSetKeyframeTangents(int trackIndex, int clipIndex, const QString &prop,
@@ -7693,8 +7827,8 @@ void AppController::setKeyframeHold(int trackIndex, int clipIndex, const QString
 
     const drift::Project before = m_project;
     key->hold = hold;
-    pushProjectEdit(before, QStringLiteral("Keyframe hold changed"));
-    finishEdit(hold ? QStringLiteral("Keyframe holds") : QStringLiteral("Keyframe interpolates"));
+    pushProjectEdit(before, tr("Keyframe hold changed"));
+    finishEdit(hold ? tr("Keyframe holds") : tr("Keyframe interpolates"));
 }
 
 void AppController::resetClipTransform(int trackIndex, int clipIndex)
@@ -7720,8 +7854,8 @@ void AppController::resetClipTransform(int trackIndex, int clipIndex)
     clip.flipH = false;
     clip.flipV = false;
     setClipLayoutPixels(clip, 0, 0, m_project.width(), m_project.height());
-    pushProjectEdit(before, QStringLiteral("Reset transform"));
-    finishEdit(QStringLiteral("Transform reset"));
+    pushProjectEdit(before, tr("Reset transform"));
+    finishEdit(tr("Transform reset"));
 }
 
 QVariantList AppController::effectCatalog() const
@@ -7792,8 +7926,8 @@ void AppController::addEffect(int trackIndex, int clipIndex, const QString &effe
     m_selectedTrack = trackIndex;
     m_selectedClip = clipIndex;
     m_selection = {qMakePair(trackIndex, clipIndex)};
-    pushProjectEdit(before, QStringLiteral("Add effect"));
-    finishEdit(QStringLiteral("Effect added"));
+    pushProjectEdit(before, tr("Add effect"));
+    finishEdit(tr("Effect added"));
 }
 
 namespace {
@@ -7837,7 +7971,10 @@ drift::Clip deriveMaskedClip(const drift::Clip &source, const drift::Mask &matte
     clip.audioEffects.clear();
     clip.mask = matte;
     clip.mask.invert = invert;
-    clip.name = (source.name.isEmpty() ? QStringLiteral("Clip") : source.name) + suffix;
+    clip.name = (source.name.isEmpty()
+                     ? QCoreApplication::translate("AppController", "Clip")
+                     : source.name)
+                + suffix;
     return clip;
 }
 
@@ -8283,8 +8420,8 @@ void AppController::applyEffectTemplateInternal(int trackIndex, int clipIndex,
     m_selectedTrack = selectTrack;
     m_selectedClip = selectClip;
     m_selection = {qMakePair(selectTrack, selectClip)};
-    pushProjectEdit(before, QStringLiteral("Apply effect template"));
-    finishEdit(QStringLiteral("Template applied"));
+    pushProjectEdit(before, tr("Apply effect template"));
+    finishEdit(tr("Template applied"));
 }
 
 void AppController::applyEffectTemplate(int trackIndex, int clipIndex, const QString &templateId)
@@ -8318,7 +8455,7 @@ void AppController::applyEffectTemplate(int trackIndex, int clipIndex, const QSt
     if (needsSegment) {
         if (!segmentationAvailable()) {
             setLastMessage(
-                QStringLiteral("This effect needs a subject cutout — open Extras to install it"),
+                tr("This effect needs a subject cutout — open Extras to install it"),
                 QStringLiteral("warning"));
             return;
         }
@@ -8351,8 +8488,8 @@ void AppController::removeEffect(int trackIndex, int clipIndex, int effectIndex)
     const drift::Project before = m_project;
     clip.effects.removeAt(effectIndex);
     dropKeyframeGraphPropertiesForEffect(effectIndex);
-    pushProjectEdit(before, QStringLiteral("Remove effect"));
-    finishEdit(QStringLiteral("Effect removed"));
+    pushProjectEdit(before, tr("Remove effect"));
+    finishEdit(tr("Effect removed"));
 }
 
 void AppController::setEffectEnabled(int trackIndex, int clipIndex, int effectIndex, bool enabled)
@@ -8372,9 +8509,9 @@ void AppController::setEffectEnabled(int trackIndex, int clipIndex, int effectIn
 
     const drift::Project before = m_project;
     clip.effects[effectIndex].enabled = enabled;
-    pushProjectEdit(before, enabled ? QStringLiteral("Enable effect")
-                                    : QStringLiteral("Disable effect"));
-    finishEdit(enabled ? QStringLiteral("Effect enabled") : QStringLiteral("Effect disabled"));
+    pushProjectEdit(before, enabled ? tr("Enable effect")
+                                    : tr("Disable effect"));
+    finishEdit(enabled ? tr("Effect enabled") : tr("Effect disabled"));
 }
 
 void AppController::moveEffect(int trackIndex, int clipIndex, int fromIndex, int toIndex)
@@ -8396,8 +8533,8 @@ void AppController::moveEffect(int trackIndex, int clipIndex, int fromIndex, int
     const drift::Project before = m_project;
     clip.effects.move(fromIndex, toIndex);
     remapKeyframeGraphPropertiesForEffectMove(fromIndex, toIndex);
-    pushProjectEdit(before, QStringLiteral("Reorder effect"));
-    finishEdit(QStringLiteral("Effect reordered"));
+    pushProjectEdit(before, tr("Reorder effect"));
+    finishEdit(tr("Effect reordered"));
 }
 
 void AppController::setEffectParam(int trackIndex, int clipIndex, int effectIndex, const QString &key,
@@ -8429,8 +8566,8 @@ void AppController::setEffectParam(int trackIndex, int clipIndex, int effectInde
         clip.effects[effectIndex].parameters.insert(key, value > 0.5);
     else
         clip.effects[effectIndex].parameters.insert(key, value);
-    pushProjectEdit(before, QStringLiteral("Edit effect"));
-    finishEdit(QStringLiteral("Effect updated"));
+    pushProjectEdit(before, tr("Edit effect"));
+    finishEdit(tr("Effect updated"));
 }
 
 // Colour params take this path rather than widening setEffectParam, which every existing QML call
@@ -8466,8 +8603,8 @@ void AppController::setEffectColorParam(int trackIndex, int clipIndex, int effec
 
     const drift::Project before = m_project;
     clip.effects[effectIndex].parameters.insert(key, color.name(QColor::HexRgb));
-    pushProjectEdit(before, QStringLiteral("Edit effect"));
-    finishEdit(QStringLiteral("Effect updated"));
+    pushProjectEdit(before, tr("Edit effect"));
+    finishEdit(tr("Effect updated"));
 }
 
 QVariantList AppController::audioEffectCatalog() const
@@ -8536,8 +8673,8 @@ void AppController::addAudioEffect(int trackIndex, int clipIndex, const QString 
     m_selectedTrack = trackIndex;
     m_selectedClip = clipIndex;
     m_selection = {qMakePair(trackIndex, clipIndex)};
-    pushProjectEdit(before, QStringLiteral("Add audio effect"));
-    finishEdit(QStringLiteral("Audio effect added"));
+    pushProjectEdit(before, tr("Add audio effect"));
+    finishEdit(tr("Audio effect added"));
 }
 
 void AppController::removeAudioEffect(int trackIndex, int clipIndex, int effectIndex)
@@ -8555,8 +8692,8 @@ void AppController::removeAudioEffect(int trackIndex, int clipIndex, int effectI
 
     const drift::Project before = m_project;
     clip.audioEffects.removeAt(effectIndex);
-    pushProjectEdit(before, QStringLiteral("Remove audio effect"));
-    finishEdit(QStringLiteral("Audio effect removed"));
+    pushProjectEdit(before, tr("Remove audio effect"));
+    finishEdit(tr("Audio effect removed"));
 }
 
 void AppController::setAudioEffectEnabled(int trackIndex, int clipIndex, int effectIndex, bool enabled)
@@ -8576,10 +8713,10 @@ void AppController::setAudioEffectEnabled(int trackIndex, int clipIndex, int eff
 
     const drift::Project before = m_project;
     clip.audioEffects[effectIndex].enabled = enabled;
-    pushProjectEdit(before, enabled ? QStringLiteral("Enable audio effect")
-                                    : QStringLiteral("Disable audio effect"));
-    finishEdit(enabled ? QStringLiteral("Audio effect enabled")
-                       : QStringLiteral("Audio effect disabled"));
+    pushProjectEdit(before, enabled ? tr("Enable audio effect")
+                                    : tr("Disable audio effect"));
+    finishEdit(enabled ? tr("Audio effect enabled")
+                       : tr("Audio effect disabled"));
 }
 
 void AppController::moveAudioEffect(int trackIndex, int clipIndex, int fromIndex, int toIndex)
@@ -8600,8 +8737,8 @@ void AppController::moveAudioEffect(int trackIndex, int clipIndex, int fromIndex
 
     const drift::Project before = m_project;
     clip.audioEffects.move(fromIndex, toIndex);
-    pushProjectEdit(before, QStringLiteral("Reorder audio effect"));
-    finishEdit(QStringLiteral("Audio effect reordered"));
+    pushProjectEdit(before, tr("Reorder audio effect"));
+    finishEdit(tr("Audio effect reordered"));
 }
 
 void AppController::previewSetAudioEffectParam(int trackIndex, int clipIndex, int effectIndex,
@@ -8621,7 +8758,7 @@ void AppController::previewSetAudioEffectParam(int trackIndex, int clipIndex, in
         return;
 
     if (!m_previewDragActive)
-        beginPreviewDrag(QStringLiteral("Edit audio effect"));
+        beginPreviewDrag(tr("Edit audio effect"));
 
     clip.audioEffects[effectIndex].parameters.insert(key, value);
     // Audio effects are heard, not seen: a preview frame won't reflect the change, but keeping the
@@ -8645,8 +8782,8 @@ void AppController::setAudioEffectParam(int trackIndex, int clipIndex, int effec
 
     const drift::Project before = m_project;
     clip.audioEffects[effectIndex].parameters.insert(key, value);
-    pushProjectEdit(before, QStringLiteral("Edit audio effect"));
-    finishEdit(QStringLiteral("Audio effect updated"));
+    pushProjectEdit(before, tr("Edit audio effect"));
+    finishEdit(tr("Audio effect updated"));
 }
 
 void AppController::setTrackMuted(int trackIndex, bool muted)
@@ -8658,8 +8795,8 @@ void AppController::setTrackMuted(int trackIndex, bool muted)
 
     const drift::Project before = m_project;
     m_project.tracks()[trackIndex].muted = muted;
-    pushProjectEdit(before, QStringLiteral("Track mute"));
-    finishEdit(muted ? QStringLiteral("Track muted") : QStringLiteral("Track unmuted"));
+    pushProjectEdit(before, tr("Track mute"));
+    finishEdit(muted ? tr("Track muted") : tr("Track unmuted"));
 }
 
 void AppController::setTrackHidden(int trackIndex, bool hidden)
@@ -8671,8 +8808,8 @@ void AppController::setTrackHidden(int trackIndex, bool hidden)
 
     const drift::Project before = m_project;
     m_project.tracks()[trackIndex].hidden = hidden;
-    pushProjectEdit(before, QStringLiteral("Track visibility"));
-    finishEdit(hidden ? QStringLiteral("Track hidden") : QStringLiteral("Track shown"));
+    pushProjectEdit(before, tr("Track visibility"));
+    finishEdit(hidden ? tr("Track hidden") : tr("Track shown"));
 }
 
 bool AppController::trackMuted(int trackIndex) const
@@ -8767,8 +8904,8 @@ void AppController::moveTrack(int fromIndex, int toIndex)
     for (QPair<int, int> &pair : m_selection)
         pair.first = remap(pair.first);
 
-    pushProjectEdit(before, QStringLiteral("Move track"));
-    finishEdit(QStringLiteral("Track moved"));
+    pushProjectEdit(before, tr("Move track"));
+    finishEdit(tr("Track moved"));
 }
 
 void AppController::removeTrack(int trackIndex)
@@ -8807,8 +8944,8 @@ void AppController::removeTrack(int trackIndex)
         m_selectedClip = m_selection.constLast().second;
     }
 
-    pushProjectEdit(before, QStringLiteral("Delete track"));
-    finishEdit(QStringLiteral("Track deleted"));
+    pushProjectEdit(before, tr("Delete track"));
+    finishEdit(tr("Track deleted"));
 }
 
 void AppController::addTrack(const QString &type)
@@ -8822,8 +8959,8 @@ void AppController::addTrack(const QString &type)
 
     const drift::Project before = m_project;
     m_project.tracks().prepend(drift::Track{.type = drift::trackTypeFromString(normalized)});
-    pushProjectEdit(before, QStringLiteral("Add track"));
-    finishEdit(QStringLiteral("Track added"));
+    pushProjectEdit(before, tr("Add track"));
+    finishEdit(tr("Track added"));
 }
 
 QVariantList AppController::bookmarks() const
@@ -8866,8 +9003,8 @@ void AppController::markWorkAreaIn()
     m_project.setWorkAreaInUs(at);
     if (m_project.workAreaOutUs() >= 0 && m_project.workAreaOutUs() <= at)
         m_project.setWorkAreaOutUs(-1);
-    pushProjectEdit(before, QStringLiteral("Mark work area in"));
-    finishEdit(QStringLiteral("Work area in marked"));
+    pushProjectEdit(before, tr("Mark work area in"));
+    finishEdit(tr("Work area in marked"));
     emit workAreaChanged();
 }
 
@@ -8880,8 +9017,8 @@ void AppController::markWorkAreaOut()
         m_project.setWorkAreaInUs(0);
     if (!m_project.hasWorkArea())
         m_project.clearWorkArea();
-    pushProjectEdit(before, QStringLiteral("Mark work area out"));
-    finishEdit(QStringLiteral("Work area out marked"));
+    pushProjectEdit(before, tr("Mark work area out"));
+    finishEdit(tr("Work area out marked"));
     emit workAreaChanged();
 }
 
@@ -8906,8 +9043,8 @@ void AppController::clearWorkArea()
 
     const drift::Project before = m_project;
     m_project.clearWorkArea();
-    pushProjectEdit(before, QStringLiteral("Clear work area"));
-    finishEdit(QStringLiteral("Work area cleared"));
+    pushProjectEdit(before, tr("Clear work area"));
+    finishEdit(tr("Work area cleared"));
     emit workAreaChanged();
 }
 
@@ -8923,8 +9060,8 @@ void AppController::addBookmark(double seconds, const QString &label)
         .timeUs = qMax<drift::TimeUs>(0, drift::secondsToUs(seconds)),
         .label = label.isEmpty() ? QStringLiteral("Bookmark") : label,
     });
-    pushProjectEdit(before, QStringLiteral("Add bookmark"));
-    finishEdit(QStringLiteral("Bookmark added"));
+    pushProjectEdit(before, tr("Add bookmark"));
+    finishEdit(tr("Bookmark added"));
 }
 
 void AppController::removeBookmark(int index)
@@ -8934,8 +9071,8 @@ void AppController::removeBookmark(int index)
 
     const drift::Project before = m_project;
     m_project.bookmarks().removeAt(index);
-    pushProjectEdit(before, QStringLiteral("Remove bookmark"));
-    finishEdit(QStringLiteral("Bookmark removed"));
+    pushProjectEdit(before, tr("Remove bookmark"));
+    finishEdit(tr("Bookmark removed"));
 }
 
 void AppController::updateBookmark(int index, double seconds, const QString &label)
@@ -8952,8 +9089,8 @@ void AppController::updateBookmark(int index, double seconds, const QString &lab
     const drift::Project before = m_project;
     bookmark.timeUs = timeUs;
     bookmark.label = resolvedLabel;
-    pushProjectEdit(before, QStringLiteral("Edit bookmark"));
-    finishEdit(QStringLiteral("Bookmark updated"));
+    pushProjectEdit(before, tr("Edit bookmark"));
+    finishEdit(tr("Bookmark updated"));
 }
 
 void AppController::goToBookmark(int index)
@@ -9087,13 +9224,13 @@ void AppController::freezeFrameAtPlayhead()
         return;
 
     if (activeVideoClipAtPlayhead().isEmpty()) {
-        setLastMessage(QStringLiteral("No video at the current time"), QStringLiteral("warning"));
+        setLastMessage(tr("No video at the current time"), QStringLiteral("warning"));
         return;
     }
 
     const QString outPath = newFreezeFramePath(m_project.id());
     if (outPath.isEmpty()) {
-        setLastMessage(QStringLiteral("Couldn’t capture a still frame"), QStringLiteral("error"));
+        setLastMessage(tr("Couldn’t capture a still frame"), QStringLiteral("error"));
         return;
     }
 
@@ -9101,7 +9238,7 @@ void AppController::freezeFrameAtPlayhead()
     // own set of retained paths and its own read-ahead. Same reason export stops playback first.
     setPlaying(false);
 
-    setLastMessage(QStringLiteral("Capturing freeze frame…"));
+    setLastMessage(tr("Capturing freeze frame…"));
     const drift::TimeUs playheadUs = m_playheadUs;
     // The worker composites off the GUI thread while editing continues, so it gets a detached
     // copy rather than a pointer into the live project.
@@ -9124,7 +9261,7 @@ void AppController::freezeFrameAtPlayhead()
             this,
             [this, ok, outPath, thumb, size, playheadUs]() {
                 if (!ok) {
-                    setLastMessage(QStringLiteral("Couldn’t capture a still frame"),
+                    setLastMessage(tr("Couldn’t capture a still frame"),
                                    QStringLiteral("error"));
                     return;
                 }
@@ -9168,8 +9305,8 @@ void AppController::freezeFrameAtPlayhead()
                                       m_project.height());
 
                 track.clips.append(freezeClip);
-                pushProjectEdit(before, QStringLiteral("Freeze frame added"));
-                finishEdit(QStringLiteral("Freeze frame added"));
+                pushProjectEdit(before, tr("Freeze frame added"));
+                finishEdit(tr("Freeze frame added"));
                 selectClip(trackIndex, track.clips.size() - 1);
             },
             Qt::QueuedConnection);
@@ -9232,11 +9369,11 @@ void AppController::pasteAtPlayhead()
 
     if (inserted.isEmpty())
         return;
-    pushProjectEdit(before, QStringLiteral("Paste"));
+    pushProjectEdit(before, tr("Paste"));
     m_selection = inserted;
     m_selectedTrack = inserted.constLast().first;
     m_selectedClip = inserted.constLast().second;
-    finishEdit(QStringLiteral("Pasted %1 clip(s)").arg(inserted.size()));
+    finishEdit(tr("Pasted %n clips", "", int(inserted.size())));
 }
 
 void AppController::nudgeSelection(double deltaSeconds)
@@ -9268,8 +9405,8 @@ void AppController::nudgeSelection(double deltaSeconds)
                                                                 clip.timelineDuration);
         }
     }
-    pushProjectEdit(before, QStringLiteral("Nudge selection"));
-    finishEdit(QStringLiteral("Selection nudged"));
+    pushProjectEdit(before, tr("Nudge selection"));
+    finishEdit(tr("Selection nudged"));
 }
 
 bool AppController::selectionContains(int trackIndex, int clipIndex) const
@@ -9455,6 +9592,7 @@ void AppController::undo()
     if (!m_undoStack.canUndo())
         return;
     m_undoStack.undo();
+    ++m_mcpEditRevision;
 }
 
 void AppController::redo()
@@ -9462,6 +9600,7 @@ void AppController::redo()
     if (!m_undoStack.canRedo())
         return;
     m_undoStack.redo();
+    ++m_mcpEditRevision;
 }
 
 namespace {
@@ -9507,6 +9646,46 @@ QVariantList reduceDensePeaks(const QVector<float> &dense, int first, int last, 
         result.append(peak < 0.0f ? 0.0 : qMax(0.05, waveformDisplayLevel(peak)));
     }
     return result;
+}
+
+// 22050 rather than the 8000 used for voice peaks: hats and cymbals, the sharpest onset cues
+// in music, live above 4 kHz.
+constexpr int kBeatAnalysisRate = 22050;
+
+// Mixes [startUs, +durUs) down to mono at kBeatAnalysisRate and runs onset/tempo detection.
+//
+// `snap` must be a copy the caller owns: this runs off the GUI thread and the mixer would
+// otherwise race the live project.
+//
+// The mix is pulled a window at a time rather than allocated whole. AudioOnsets needs the mono
+// buffer contiguous, so that one stays, but holding the interleaved stereo alongside it doubled
+// the peak for no reason — at the ten-minute ceiling MCP allows that is 106 MB of scratch to
+// produce 53 MB of mono.
+AudioBeatAnalysis runBeatAnalysis(const drift::Project &snap, drift::TimeUs startUs,
+                                  drift::TimeUs durUs, double startSeconds)
+{
+    const int frames =
+        static_cast<int>((static_cast<double>(durUs) / 1'000'000.0) * kBeatAnalysisRate);
+    if (frames <= 0)
+        return {};
+
+    AudioMixer mixer;
+    mixer.setProject(&snap);
+
+    constexpr int kWindowFrames = 1 << 18;
+    QVector<float> mono(frames, 0.0f);
+    QVector<float> window(static_cast<qsizetype>(kWindowFrames) * 2);
+    for (int done = 0; done < frames;) {
+        const int want = qMin(kWindowFrames, frames - done);
+        const drift::TimeUs at =
+            startUs + static_cast<drift::TimeUs>(done) * drift::kUsPerSecond / kBeatAnalysisRate;
+        mixer.mix(at, want, kBeatAnalysisRate, window.data());
+        for (int i = 0; i < want; ++i)
+            mono[done + i] = 0.5f * (window[i * 2] + window[i * 2 + 1]);
+        done += want;
+    }
+
+    return AudioOnsets::analyze(mono.constData(), frames, kBeatAnalysisRate, startSeconds);
 }
 
 } // namespace
@@ -9709,23 +9888,7 @@ void AppController::analyzeBeats(double startSeconds, double durSeconds)
     const QByteArray fingerprint = audioLayoutFingerprint();
     (void)QtConcurrent::run([this, snap, startUs, durUs, startSeconds, durSeconds, generation,
                              fingerprint] {
-        // 22050 rather than the 8000 used for voice peaks: hats and cymbals, the sharpest
-        // onset cues in music, live above 4 kHz.
-        const int rate = 22050;
-        const int frames = static_cast<int>((static_cast<double>(durUs) / 1'000'000.0) * rate);
-        AudioBeatAnalysis analysis;
-        if (frames > 0) {
-            QVector<float> stereo(static_cast<qsizetype>(frames) * 2, 0.0f);
-            AudioMixer mixer;
-            mixer.setProject(&snap);
-            mixer.mix(startUs, frames, rate, stereo.data());
-
-            QVector<float> mono(frames, 0.0f);
-            for (int i = 0; i < frames; ++i)
-                mono[i] = 0.5f * (stereo[i * 2] + stereo[i * 2 + 1]);
-
-            analysis = AudioOnsets::analyze(mono.constData(), frames, rate, startSeconds);
-        }
+        const AudioBeatAnalysis analysis = runBeatAnalysis(snap, startUs, durUs, startSeconds);
         QMetaObject::invokeMethod(
             this,
             [this, analysis, startSeconds, durSeconds, generation, fingerprint] {
@@ -10101,11 +10264,11 @@ void AppController::saveProject(const QUrl &url)
 {
     const QString path = url.toLocalFile();
     if (path.isEmpty()) {
-        setLastMessage(QStringLiteral("That save location isn’t valid"), QStringLiteral("error"));
+        setLastMessage(tr("That save location isn’t valid"), QStringLiteral("error"));
         return;
     }
     if (m_packaging) {
-        setLastMessage(QStringLiteral("Already saving"), QStringLiteral("warning"));
+        setLastMessage(tr("Already saving"), QStringLiteral("warning"));
         return;
     }
 
@@ -10124,14 +10287,14 @@ void AppController::saveProject(const QUrl &url)
     setDirty(false);
     deleteRecoveryFile();
     emit projectMetadataChanged();
-    setLastMessage(QStringLiteral("Project saved"), QStringLiteral("success"));
+    setLastMessage(tr("Project saved"), QStringLiteral("success"));
 }
 
 void AppController::packageProject(const QUrl &url)
 {
     const QString path = url.toLocalFile();
     if (path.isEmpty()) {
-        setLastMessage(QStringLiteral("That save location isn’t valid"), QStringLiteral("error"));
+        setLastMessage(tr("That save location isn’t valid"), QStringLiteral("error"));
         return;
     }
     if (m_packaging)
@@ -10182,7 +10345,7 @@ void AppController::packageProject(const QUrl &url)
                 setDirty(false);
                 deleteRecoveryFile();
                 emit projectMetadataChanged();
-                setLastMessage(QStringLiteral("Shareable copy ready"), QStringLiteral("success"));
+                setLastMessage(tr("Shareable copy ready"), QStringLiteral("success"));
                 emit packageFinished(true, QStringLiteral("Shareable copy ready"));
             },
             Qt::QueuedConnection);
@@ -10198,7 +10361,7 @@ void AppController::loadProject(const QUrl &url)
 {
     const QString path = url.toLocalFile();
     if (path.isEmpty()) {
-        setLastMessage(QStringLiteral("That project location isn’t valid"), QStringLiteral("error"));
+        setLastMessage(tr("That project location isn’t valid"), QStringLiteral("error"));
         return;
     }
 
@@ -10247,7 +10410,7 @@ void AppController::loadProject(const QUrl &url)
         addRecentProject(path);
         deleteRecoveryFile();
         setProjectLayoutChosen(true);
-        setLastMessage(QStringLiteral("Project loaded"), QStringLiteral("success"));
+        setLastMessage(tr("Project loaded"), QStringLiteral("success"));
         reportMissingAddons(bundle.addons);
     };
 
@@ -10256,7 +10419,7 @@ void AppController::loadProject(const QUrl &url)
         return;
     }
 
-    setLastMessage(QStringLiteral("Unpacking project media…"));
+    setLastMessage(tr("Unpacking project media…"));
     (void)QtConcurrent::run([this, path, destDir, generation, finishLoad]() {
         QString error;
         QHash<QString, QString> remap;
@@ -10366,7 +10529,7 @@ void AppController::newProject()
     emit projectNameChanged();
     emit projectMetadataChanged();
     emit backgroundChanged();
-    setLastMessage(QStringLiteral("New project"));
+    setLastMessage(tr("New project"));
 }
 
 void AppController::openRecentProject(const QString &path)
@@ -10511,7 +10674,7 @@ void AppController::restoreAutosave()
     const QString path = recoveryFilePath();
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) {
-        setLastMessage(QStringLiteral("No recovery file found"), QStringLiteral("warning"));
+        setLastMessage(tr("No recovery file found"), QStringLiteral("warning"));
         return;
     }
 
@@ -10533,14 +10696,14 @@ void AppController::restoreAutosave()
     m_recoveryInfo.clear();
     emit recoveryChanged();
     setProjectLayoutChosen(true);
-    setLastMessage(QStringLiteral("Recovered unsaved work"), QStringLiteral("success"));
+    setLastMessage(tr("Recovered unsaved work"), QStringLiteral("success"));
 }
 
 void AppController::discardAutosave()
 {
     // Fresh timeline and clear the autosave snapshot from the previous session.
     newProject();
-    setLastMessage(QStringLiteral("Started new session"));
+    setLastMessage(tr("Started new session"));
 }
 
 bool AppController::restoreLastSessionIfEnabled()
@@ -10682,10 +10845,12 @@ QString AppController::lastExportFolder() const
 void AppController::rememberExportChoice(const QString &outputPath, const QVariantMap &settings)
 {
     QSettings store;
-    const QFileInfo info(outputPath);
-    const QString folder = info.absolutePath();
-    if (!folder.isEmpty() && QDir(folder).exists())
-        store.setValue(QStringLiteral("export/lastFolder"), folder);
+    if (!outputPath.isEmpty()) {
+        const QFileInfo info(outputPath);
+        const QString folder = info.absolutePath();
+        if (!folder.isEmpty() && QDir(folder).exists())
+            store.setValue(QStringLiteral("export/lastFolder"), folder);
+    }
 
     store.beginGroup(QStringLiteral("export"));
     const auto put = [&](const QString &key) {
@@ -10761,13 +10926,13 @@ void AppController::exportWithSettings(const QUrl &outputUrl, const QVariantMap 
 {
     const QString outputPath = outputUrl.toLocalFile();
     if (outputPath.isEmpty()) {
-        setLastMessage(QStringLiteral("That save location isn’t valid"), QStringLiteral("error"));
+        setLastMessage(tr("That save location isn’t valid"), QStringLiteral("error"));
         emit exportFinished(false);
         return;
     }
 
     if (m_exportInProgress) {
-        setLastMessage(QStringLiteral("Export already in progress"), QStringLiteral("warning"));
+        setLastMessage(tr("Export already in progress"), QStringLiteral("warning"));
         return;
     }
 
@@ -10783,7 +10948,7 @@ void AppController::exportWithSettings(const QUrl &outputUrl, const QVariantMap 
     emit exportProgressChanged();
     m_exportInProgress = true;
     emit exportInProgressChanged();
-    setLastMessage(QStringLiteral("Exporting..."));
+    setLastMessage(tr("Exporting…"));
 
     // Snapshot the project so edits during export can't race the encoder.
     const drift::Project snapshot = m_project;
@@ -10809,10 +10974,949 @@ void AppController::exportWithSettings(const QUrl &outputUrl, const QVariantMap 
                 m_exportProgress = ok ? 1.0 : 0.0;
                 emit exportProgressChanged();
                 emit exportInProgressChanged();
-                setLastMessage(ok ? QStringLiteral("Export complete") : error,
+                setLastMessage(ok ? tr("Export complete") : error,
                                ok ? QStringLiteral("success") : QStringLiteral("error"));
                 emit exportFinished(ok);
             },
             Qt::QueuedConnection);
     });
+}
+
+bool AppController::mcpRunning() const
+{
+    return m_mcp && m_mcp->running();
+}
+
+QString AppController::mcpUrl() const
+{
+    return m_mcp ? m_mcp->url() : QString();
+}
+
+QString AppController::mcpToken() const
+{
+    return m_mcp ? m_mcp->token() : QString();
+}
+
+int AppController::mcpPort() const
+{
+    return m_mcp ? int(m_mcp->port()) : 0;
+}
+
+QString AppController::mcpError() const
+{
+    return m_mcp ? m_mcp->error() : QString();
+}
+
+QString AppController::mcpCursorSnippet() const
+{
+    return m_mcp ? m_mcp->cursorSnippet() : QString();
+}
+
+QString AppController::mcpClaudeCommand() const
+{
+    return m_mcp ? m_mcp->claudeCommand() : QString();
+}
+
+QString AppController::mcpStdioSnippet() const
+{
+    const QJsonObject server{
+        {QStringLiteral("command"), QCoreApplication::applicationFilePath()},
+        {QStringLiteral("args"), QJsonArray{QStringLiteral("--mcp-stdio")}},
+    };
+    const QJsonObject root{
+        {QStringLiteral("mcpServers"), QJsonObject{{QStringLiteral("drift"), server}}},
+    };
+    return QString::fromUtf8(QJsonDocument(root).toJson(QJsonDocument::Indented));
+}
+
+void AppController::setMcpEnabled(bool enabled)
+{
+    if (!m_mcp)
+        return;
+    if (enabled)
+        m_mcp->start();
+    else
+        m_mcp->stop();
+}
+
+namespace {
+
+void copyToClipboard(const QString &text)
+{
+    if (text.isEmpty())
+        return;
+    if (QClipboard *clip = QGuiApplication::clipboard())
+        clip->setText(text);
+}
+
+} // namespace
+
+void AppController::copyMcpCursorSnippet()
+{
+    copyToClipboard(mcpCursorSnippet());
+}
+
+void AppController::copyMcpClaudeCommand()
+{
+    copyToClipboard(mcpClaudeCommand());
+}
+
+void AppController::copyMcpStdioSnippet()
+{
+    copyToClipboard(mcpStdioSnippet());
+}
+
+QString AppController::mcpAgentGuide() const
+{
+    QString guide = drift::mcp::agentGuideText();
+    if (m_mcp && m_mcp->running()) {
+        guide += QStringLiteral("\nThis session:\nURL: %1\nToken: %2\n")
+                     .arg(mcpUrl(), mcpToken());
+    }
+    return guide;
+}
+
+void AppController::copyMcpAgentGuide()
+{
+    copyToClipboard(mcpAgentGuide());
+}
+
+void AppController::rebuildMcpClipIndexIfNeeded() const
+{
+    if (m_mcpClipIndexRevision == m_mcpEditRevision)
+        return;
+    m_mcpClipIndex.clear();
+    const QList<drift::Track> &tracks = m_project.tracks();
+    for (int t = 0; t < tracks.size(); ++t) {
+        const QList<drift::Clip> &clips = tracks.at(t).clips;
+        for (int c = 0; c < clips.size(); ++c)
+            m_mcpClipIndex.insert(clips.at(c).id, {t, c});
+    }
+    m_mcpClipIndexRevision = m_mcpEditRevision;
+}
+
+QPair<int, int> AppController::mcpLocateClip(const QString &id) const
+{
+    if (id.isEmpty())
+        return {-1, -1};
+    rebuildMcpClipIndexIfNeeded();
+    return m_mcpClipIndex.value(id, {-1, -1});
+}
+
+QString AppController::mcpClipId(int trackIndex, int clipIndex) const
+{
+    if (!isValidClipIndex(trackIndex, clipIndex))
+        return {};
+    return m_project.tracks().at(trackIndex).clips.at(clipIndex).id;
+}
+
+QVariantMap AppController::mcpCompactClip(int trackIndex, int clipIndex, bool includeCanvas) const
+{
+    if (!isValidClipIndex(trackIndex, clipIndex))
+        return {};
+    const drift::Clip &clip = m_project.tracks().at(trackIndex).clips.at(clipIndex);
+    QVariantMap out{
+        {QStringLiteral("id"), clip.id},
+        {QStringLiteral("kind"), drift::clipTypeToString(clip.type)},
+        {QStringLiteral("name"), clip.name},
+        {QStringLiteral("start"), drift::usToSeconds(clip.timelineStart)},
+        {QStringLiteral("duration"), drift::usToSeconds(clip.timelineDuration)},
+        {QStringLiteral("inPoint"), drift::usToSeconds(clip.srcIn)},
+        {QStringLiteral("outPoint"), drift::usToSeconds(clip.srcOut)},
+        {QStringLiteral("assetId"), clip.assetId},
+    };
+    if (!includeCanvas)
+        return out;
+
+    const double at = playheadSeconds();
+    out.insert(QStringLiteral("x"), propertyValueAt(trackIndex, clipIndex, QStringLiteral("x"), at, 0));
+    out.insert(QStringLiteral("y"), propertyValueAt(trackIndex, clipIndex, QStringLiteral("y"), at, 0));
+    out.insert(QStringLiteral("w"), propertyValueAt(trackIndex, clipIndex, QStringLiteral("width"), at, 0));
+    out.insert(QStringLiteral("h"), propertyValueAt(trackIndex, clipIndex, QStringLiteral("height"), at, 0));
+    out.insert(QStringLiteral("rotation"),
+               propertyValueAt(trackIndex, clipIndex, QStringLiteral("rotation"), at, 0));
+    out.insert(QStringLiteral("opacity"),
+               propertyValueAt(trackIndex, clipIndex, QStringLiteral("opacity"), at, 1));
+    return out;
+}
+
+QJsonObject AppController::mcpInspect(bool includeClips, int sinceRevision, bool detail) const
+{
+    using namespace drift::mcp;
+    if (sinceRevision >= 0 && sinceRevision == m_mcpEditRevision)
+        return ok({{QStringLiteral("unchanged"), true}, {QStringLiteral("revision"), m_mcpEditRevision}});
+
+    int clipCount = 0;
+    QJsonArray trackRows;
+    const QList<drift::Track> &projectTracks = m_project.tracks();
+    const QVariantList trackModels = detail ? tracks() : QVariantList{};
+    for (int t = 0; t < projectTracks.size(); ++t) {
+        const drift::Track &track = projectTracks.at(t);
+        clipCount += track.clips.size();
+        QJsonObject row{
+            {QStringLiteral("i"), t},
+            {QStringLiteral("type"), drift::trackTypeToString(track.type)},
+            {QStringLiteral("clips"), track.clips.size()},
+            {QStringLiteral("muted"), track.muted},
+            {QStringLiteral("hidden"), track.hidden},
+        };
+        if (detail && t < trackModels.size()) {
+            const QVariantMap tm = trackModels.at(t).toMap();
+            row.insert(QStringLiteral("showWaveform"), tm.value(QStringLiteral("showWaveform")).toBool());
+            row.insert(QStringLiteral("heightScale"), tm.value(QStringLiteral("heightScale")).toDouble());
+            const QVariantList transitions = tm.value(QStringLiteral("transitions")).toList();
+            QJsonArray trJson;
+            for (const QVariant &tr : transitions)
+                trJson.append(QJsonObject::fromVariantMap(tr.toMap()));
+            if (!trJson.isEmpty())
+                row.insert(QStringLiteral("transitions"), trJson);
+        }
+        if (includeClips) {
+            QJsonArray clips;
+            for (int c = 0; c < track.clips.size(); ++c) {
+                if (detail && t < trackModels.size()) {
+                    const QVariantList clipList = trackModels.at(t).toMap().value(QStringLiteral("clips")).toList();
+                    if (c < clipList.size())
+                        clips.append(QJsonObject::fromVariantMap(clipList.at(c).toMap()));
+                } else {
+                    const QVariantMap compact = mcpCompactClip(t, c, false);
+                    clips.append(QJsonObject::fromVariantMap(compact));
+                }
+            }
+            row.insert(QStringLiteral("items"), clips);
+        }
+        trackRows.append(row);
+    }
+
+    QJsonArray assets;
+    if (m_assetLibrary) {
+        for (int i = 0; i < m_assetLibrary->count(); ++i) {
+            const QVariantMap a = m_assetLibrary->assetAt(i);
+            assets.append(QJsonObject{
+                {QStringLiteral("index"), i},
+                {QStringLiteral("id"), a.value(QStringLiteral("id")).toString()},
+                {QStringLiteral("name"), a.value(QStringLiteral("name")).toString()},
+                {QStringLiteral("kind"), a.value(QStringLiteral("kind")).toString()},
+                {QStringLiteral("dur"), a.value(QStringLiteral("durationSeconds")).toDouble()},
+            });
+        }
+    }
+
+    QJsonObject extra{
+        {QStringLiteral("revision"), m_mcpEditRevision},
+        {QStringLiteral("name"), m_project.name()},
+        {QStringLiteral("w"), m_project.width()},
+        {QStringLiteral("h"), m_project.height()},
+        {QStringLiteral("fps"), m_project.fps()},
+        {QStringLiteral("dur"), drift::usToSeconds(m_project.durationUs())},
+        {QStringLiteral("playhead"), playheadSeconds()},
+        {QStringLiteral("playing"), playing()},
+        {QStringLiteral("overlap"), m_allowClipOverlap},
+        {QStringLiteral("clips"), clipCount},
+        {QStringLiteral("tracks"), trackRows},
+        {QStringLiteral("assets"), assets},
+        {QStringLiteral("path"), m_currentProjectPath},
+        {QStringLiteral("dirty"), m_dirty},
+        {QStringLiteral("background"), QJsonObject::fromVariantMap(background())},
+        {QStringLiteral("export"),
+         QJsonObject{{QStringLiteral("active"), m_exportInProgress},
+                     {QStringLiteral("progress"), m_exportProgress}}},
+    };
+    if (detail) {
+        QJsonArray marks;
+        for (const QVariant &v : bookmarks()) {
+            const QVariantMap b = v.toMap();
+            marks.append(QJsonObject{
+                {QStringLiteral("at"), b.value(QStringLiteral("seconds")).toDouble()},
+                {QStringLiteral("label"), b.value(QStringLiteral("label")).toString()},
+            });
+        }
+        extra.insert(QStringLiteral("bookmarks"), marks);
+        extra.insert(QStringLiteral("package"),
+                     QJsonObject{{QStringLiteral("active"), packaging()},
+                                 {QStringLiteral("progress"), packageProgress()}});
+        extra.insert(QStringLiteral("subtitleGen"),
+                     QJsonObject{{QStringLiteral("active"), subtitleGenerating()},
+                                 {QStringLiteral("progress"), subtitleGenProgress()},
+                                 {QStringLiteral("status"), subtitleGenStatus()}});
+        extra.insert(QStringLiteral("reverseRender"),
+                     QJsonObject{{QStringLiteral("active"), reverseRendering()},
+                                 {QStringLiteral("progress"), reverseRenderProgress()},
+                                 {QStringLiteral("status"), reverseRenderStatus()}});
+        // Beat state without the arrays — detect_beats returns those. `stale` matters because
+        // finishEdit drops the analysis as soon as the mix changes, so a grid an agent found a
+        // few ops ago may already be gone.
+        QJsonObject beatState{
+            {QStringLiteral("active"), m_beatAnalysisRunning},
+            {QStringLiteral("analysed"), !m_beatAnalysis.isEmpty()},
+            {QStringLiteral("gridVisible"), m_beatGridVisible},
+            {QStringLiteral("onsetsVisible"), m_onsetsVisible},
+        };
+        if (!m_beatAnalysis.isEmpty()) {
+            beatState.insert(QStringLiteral("bpm"), m_beatAnalysisRaw.bpm);
+            beatState.insert(QStringLiteral("confidence"), m_beatAnalysisRaw.confidence);
+            beatState.insert(QStringLiteral("rangeStart"),
+                             m_beatAnalysis.value(QStringLiteral("rangeStart")).toDouble());
+            beatState.insert(QStringLiteral("rangeDuration"),
+                             m_beatAnalysis.value(QStringLiteral("rangeDuration")).toDouble());
+            beatState.insert(QStringLiteral("n"), static_cast<int>(m_beatAnalysisRaw.beats.size()));
+            beatState.insert(QStringLiteral("onsets"),
+                             static_cast<int>(m_beatAnalysisRaw.onsets.size()));
+            beatState.insert(QStringLiteral("stale"),
+                             m_beatAudioFingerprint != audioLayoutFingerprint());
+        }
+        extra.insert(QStringLiteral("beats"), beatState);
+    }
+    if (m_project.hasWorkArea()) {
+        extra.insert(QStringLiteral("work_in"), workAreaInSeconds());
+        extra.insert(QStringLiteral("work_out"), workAreaOutSeconds());
+    }
+    return ok(extra);
+}
+
+bool AppController::mcpSetWorkArea(double inSeconds, double outSeconds)
+{
+    const drift::TimeUs inUs = qMax<drift::TimeUs>(0, drift::secondsToUs(inSeconds));
+    const drift::TimeUs outUs = drift::secondsToUs(outSeconds);
+    if (outUs <= inUs)
+        return false;
+
+    const drift::Project before = m_project;
+    m_project.setWorkAreaInUs(inUs);
+    m_project.setWorkAreaOutUs(outUs);
+    pushProjectEdit(before, QStringLiteral("Work area"));
+    finishEdit(QStringLiteral("Work area set"));
+    emit workAreaChanged();
+    return true;
+}
+
+void AppController::mcpRememberExportSettings(const QVariantMap &settings)
+{
+    rememberExportChoice({}, settings);
+}
+
+bool AppController::mcpSetClipCanvas(int trackIndex, int clipIndex, const QVariantMap &patch)
+{
+    if (!isValidClipIndex(trackIndex, clipIndex))
+        return false;
+
+    drift::Track &track = m_project.tracks()[trackIndex];
+    drift::Clip &clip = track.clips[clipIndex];
+    if (clip.type == drift::ClipType::Audio)
+        return false;
+
+    const drift::Project before = m_project;
+    const drift::TimeUs relative = qMax<drift::TimeUs>(0, m_playheadUs - clip.timelineStart);
+    bool any = false;
+    auto write = [&](const QString &patchKey, const QString &prop) {
+        if (!patch.contains(patchKey))
+            return;
+        any = writeClipPropValue(clip, prop, relative, patch.value(patchKey).toDouble(), true, true)
+              || any;
+    };
+    write(QStringLiteral("x"), QStringLiteral("x"));
+    write(QStringLiteral("y"), QStringLiteral("y"));
+    write(QStringLiteral("w"), QStringLiteral("width"));
+    write(QStringLiteral("h"), QStringLiteral("height"));
+    write(QStringLiteral("rotation"), QStringLiteral("rotation"));
+    write(QStringLiteral("opacity"), QStringLiteral("opacity"));
+    if (!any)
+        return false;
+
+    if (!m_mcpUndoSuspended) {
+        pushProjectEdit(before, QStringLiteral("MCP canvas"));
+        finishEdit(QStringLiteral("MCP canvas"));
+    } else {
+        emitPreviewFrame();
+    }
+    return true;
+}
+
+QJsonObject AppController::mcpCaptureFrame(double atSeconds, bool full)
+{
+    using namespace drift::mcp;
+    setPlaying(false);
+
+    const drift::TimeUs timeUs =
+        atSeconds < 0.0 ? m_playheadUs : qMax<drift::TimeUs>(0, drift::secondsToUs(atSeconds));
+    const auto snapshot = std::make_shared<const drift::Project>(m_project.detachedCopy());
+    FrameCompositor::RenderOptions options;
+    if (!full) {
+        const int longEdge = qMax(snapshot->width(), snapshot->height());
+        if (longEdge > 1280)
+            options.previewScale = 1280.0 / double(longEdge);
+    }
+
+    auto frame = std::make_shared<QImage>();
+    QEventLoop loop;
+    (void)QtConcurrent::run([snapshot, timeUs, options, frame, &loop]() {
+        FrameCompositor compositor;
+        compositor.setProject(snapshot.get());
+        *frame = compositor.compositeAt(timeUs, options);
+        QMetaObject::invokeMethod(&loop, &QEventLoop::quit, Qt::QueuedConnection);
+    });
+    loop.exec();
+
+    if (frame->isNull())
+        return textResult(err("capture_failed", QStringLiteral("Compositor returned no frame")), true);
+
+    const QJsonObject meta = ok({
+        {QStringLiteral("at"), drift::usToSeconds(timeUs)},
+        {QStringLiteral("w"), frame->width()},
+        {QStringLiteral("h"), frame->height()},
+        {QStringLiteral("full"), full},
+    });
+
+    if (full) {
+        const QString outPath = newFreezeFramePath(m_project.id());
+        if (outPath.isEmpty() || !frame->save(outPath, "PNG"))
+            return textResult(err("capture_failed", QStringLiteral("Could not write PNG")), true);
+        QJsonObject withPath = meta;
+        withPath.insert(QStringLiteral("path"), outPath);
+        return textResult(withPath);
+    }
+
+    QByteArray jpeg;
+    QBuffer buffer(&jpeg);
+    buffer.open(QIODevice::WriteOnly);
+    if (!frame->save(&buffer, "JPEG", 80))
+        return textResult(err("capture_failed", QStringLiteral("Could not encode JPEG")), true);
+
+    QJsonArray content;
+    content.append(QJsonObject{
+        {QStringLiteral("type"), QStringLiteral("text")},
+        {QStringLiteral("text"), QString::fromUtf8(QJsonDocument(meta).toJson(QJsonDocument::Compact))},
+    });
+    content.append(QJsonObject{
+        {QStringLiteral("type"), QStringLiteral("image")},
+        {QStringLiteral("mimeType"), QStringLiteral("image/jpeg")},
+        {QStringLiteral("data"), QString::fromLatin1(jpeg.toBase64())},
+    });
+    return {{QStringLiteral("content"), content}, {QStringLiteral("isError"), false}};
+}
+
+namespace {
+
+// Caps for the audio reads. The MCP transport has no chunking — textResult serialises one
+// compact JSON block and writes it whole — so every unbounded array needs a ceiling here.
+constexpr int kMcpDefaultBuckets = 400;
+constexpr int kMcpMaxBuckets = 4096;   // matches waveformPeaksRange
+constexpr double kMcpMaxWaveformSeconds = 3600.0;
+constexpr double kMcpMaxBeatSeconds = 600.0;  // bounds the windowed mix to ~53 MB of mono
+constexpr int kMcpMaxBeats = 2000;
+constexpr int kMcpMaxOnsets = 500;
+
+double round3(double v)
+{
+    return std::round(v * 1000.0) / 1000.0;
+}
+
+double round2(double v)
+{
+    return std::round(v * 100.0) / 100.0;
+}
+
+// Max-reduce raw peaks into `buckets`. Deliberately not reduceDensePeaks: that one applies a
+// dB curve and a 0.05 visibility floor, both of which are drawing decisions. An agent asking
+// whether a stretch is silent has to be able to get 0 back.
+QVector<float> reduceRawPeaks(const QVector<float> &src, int buckets)
+{
+    if (src.isEmpty() || buckets <= 0)
+        return {};
+    if (src.size() <= buckets)
+        return src;
+
+    QVector<float> out(buckets, 0.0f);
+    for (int b = 0; b < buckets; ++b) {
+        int i0 = static_cast<int>((static_cast<qint64>(b) * src.size()) / buckets);
+        int i1 = static_cast<int>((static_cast<qint64>(b + 1) * src.size()) / buckets);
+        if (i1 <= i0)
+            i1 = qMin(src.size(), i0 + 1);
+        float peak = 0.0f;
+        for (int i = i0; i < i1; ++i)
+            peak = qMax(peak, src[i]);
+        out[b] = peak;
+    }
+    return out;
+}
+
+QJsonObject peaksReply(const QVector<float> &peaks, double startSeconds, double durSeconds,
+                       const QString &source)
+{
+    using namespace drift::mcp;
+    if (peaks.isEmpty())
+        return err("not_found", QStringLiteral("No audio decoded for that range"));
+
+    QJsonArray values;
+    double maxPeak = 0.0;
+    for (float p : peaks) {
+        values.append(round3(p));
+        maxPeak = qMax(maxPeak, static_cast<double>(p));
+    }
+    return ok({
+        {QStringLiteral("source"), source},
+        {QStringLiteral("start"), round3(startSeconds)},
+        {QStringLiteral("duration"), round3(durSeconds)},
+        {QStringLiteral("buckets"), values.size()},
+        {QStringLiteral("max"), round3(maxPeak)},
+        {QStringLiteral("peaks"), values},
+    });
+}
+
+// Decodes off the GUI thread and waits, so the reply carries data on the first call. Same
+// nested-event-loop shape mcpCaptureFrame uses.
+QVector<float> blockingSourcePeaks(const QString &path, double startSeconds, double durSeconds,
+                                   int buckets)
+{
+    if (path.isEmpty() || durSeconds <= 0.0)
+        return {};
+
+    // Oversample a little before reducing so a bucket boundary cannot land on the only loud
+    // sample in its span, then clamp to the rate the block cache uses.
+    const int pps = qBound(1, static_cast<int>(std::ceil(buckets / durSeconds)) * 4, 100);
+
+    auto raw = std::make_shared<QVector<float>>();
+    QEventLoop loop;
+    (void)QtConcurrent::run([path, startSeconds, durSeconds, pps, raw, &loop]() {
+        *raw = MediaWaveform::peaksForRange(path, startSeconds, startSeconds + durSeconds, pps);
+        QMetaObject::invokeMethod(&loop, &QEventLoop::quit, Qt::QueuedConnection);
+    });
+    loop.exec();
+
+    return reduceRawPeaks(*raw, buckets);
+}
+
+} // namespace
+
+QJsonObject AppController::mcpWaveformForClip(int trackIndex, int clipIndex, int buckets) const
+{
+    using namespace drift::mcp;
+    const QList<drift::Track> &tracks = m_project.tracks();
+    if (trackIndex < 0 || trackIndex >= tracks.size())
+        return err("not_found", QStringLiteral("No such track"));
+    const drift::Track &track = tracks.at(trackIndex);
+    if (clipIndex < 0 || clipIndex >= track.clips.size())
+        return err("not_found", QStringLiteral("No such clip"));
+
+    const drift::Clip &clip = track.clips.at(clipIndex);
+    if (clip.path.isEmpty())
+        return err("type_mismatch", QStringLiteral("Clip has no media file (text or shape clip)"));
+
+    const double srcIn = drift::usToSeconds(clip.srcIn);
+    const double span = drift::usToSeconds(clip.srcOut - clip.srcIn);
+    if (span <= 0.0)
+        return err("type_mismatch", QStringLiteral("Clip has no source span"));
+
+    const QVector<float> peaks = blockingSourcePeaks(clip.path, srcIn, span, buckets);
+    return peaksReply(peaks, srcIn, span, QStringLiteral("clip"));
+}
+
+QJsonObject AppController::mcpWaveformForAsset(const QString &assetId, double startSeconds,
+                                               double durSeconds, int buckets) const
+{
+    using namespace drift::mcp;
+    const drift::MediaAsset *asset = m_project.asset(assetId);
+    if (!asset)
+        return err("not_found", QStringLiteral("Unknown asset"));
+    if (asset->path.isEmpty())
+        return err("type_mismatch", QStringLiteral("Asset has no file"));
+
+    const double total = drift::usToSeconds(asset->durationUs);
+    const double start = qMax(0.0, startSeconds);
+    const double span = durSeconds > 0.0 ? qMin(durSeconds, total - start) : total - start;
+    if (span <= 0.0)
+        return err("bad_args", QStringLiteral("Range is past the end of the asset"));
+    if (span > kMcpMaxWaveformSeconds) {
+        return err("bad_args", QStringLiteral("duration must be <= %1 seconds")
+                                   .arg(kMcpMaxWaveformSeconds));
+    }
+
+    const QVector<float> peaks = blockingSourcePeaks(asset->path, start, span, buckets);
+    return peaksReply(peaks, start, span, QStringLiteral("asset"));
+}
+
+QJsonObject AppController::mcpWaveformForTimeline(double startSeconds, double durSeconds,
+                                                  int buckets) const
+{
+    using namespace drift::mcp;
+    if (durSeconds <= 0.0)
+        return err("bad_args", QStringLiteral("duration must be > 0"));
+    if (durSeconds > kMcpMaxWaveformSeconds) {
+        return err("bad_args", QStringLiteral("duration must be <= %1 seconds")
+                                   .arg(kMcpMaxWaveformSeconds));
+    }
+
+    const double start = qMax(0.0, startSeconds);
+    const drift::TimeUs startUs = drift::secondsToUs(start);
+    const int rate = 8000; // envelope only; the sample rate does not change where the peaks land
+    const qint64 frames = static_cast<qint64>(durSeconds * rate);
+    if (frames <= 0)
+        return err("bad_args", QStringLiteral("duration is too short to measure"));
+
+    const drift::Project snap = m_project;
+    auto raw = std::make_shared<QVector<float>>();
+    QEventLoop loop;
+    (void)QtConcurrent::run([snap, startUs, frames, rate, buckets, raw, &loop]() {
+        AudioMixer mixer;
+        mixer.setProject(&snap);
+        const int peakBuckets = static_cast<int>(qMin<qint64>(buckets, frames));
+        *raw = MediaWaveform::mixedPeaks(
+            frames, rate, peakBuckets,
+            [&mixer, startUs, rate](float *out, qint64 frameOffset, int maxFrames) {
+                const drift::TimeUs at = startUs + frameOffset * drift::kUsPerSecond / rate;
+                mixer.mix(at, maxFrames, rate, out);
+                return maxFrames;
+            });
+        QMetaObject::invokeMethod(&loop, &QEventLoop::quit, Qt::QueuedConnection);
+    });
+    loop.exec();
+
+    // The mixer always returns samples, silent or not, so an all-zero result is a real answer
+    // here rather than the "nothing decoded" peaksReply reports for a source read.
+    if (raw->isEmpty())
+        return err("not_found", QStringLiteral("Nothing to mix in that range"));
+    return peaksReply(*raw, start, durSeconds, QStringLiteral("timeline"));
+}
+
+QJsonObject AppController::mcpBeatPayload() const
+{
+    using namespace drift::mcp;
+    if (m_beatAnalysis.isEmpty())
+        return err("not_found", QStringLiteral("No beat analysis yet — call detect_beats first"));
+
+    QJsonArray beats;
+    for (double b : m_beatAnalysisRaw.beats) {
+        if (beats.size() >= kMcpMaxBeats)
+            break;
+        beats.append(round3(b));
+    }
+
+    // Keep the strongest onsets when there are too many, then put them back in time order —
+    // a truncation by time would silently hide the whole back half of the range.
+    QList<AudioOnset> onsets = m_beatAnalysisRaw.onsets;
+    if (onsets.size() > kMcpMaxOnsets) {
+        std::partial_sort(onsets.begin(), onsets.begin() + kMcpMaxOnsets, onsets.end(),
+                          [](const AudioOnset &a, const AudioOnset &b) {
+                              return a.strength > b.strength;
+                          });
+        onsets.resize(kMcpMaxOnsets);
+        std::sort(onsets.begin(), onsets.end(),
+                  [](const AudioOnset &a, const AudioOnset &b) { return a.seconds < b.seconds; });
+    }
+    QJsonArray onsetRows;
+    for (const AudioOnset &o : std::as_const(onsets)) {
+        onsetRows.append(QJsonObject{{QStringLiteral("at"), round3(o.seconds)},
+                                     {QStringLiteral("s"), round2(o.strength)}});
+    }
+
+    return ok({
+        {QStringLiteral("start"), round3(m_beatAnalysis.value(QStringLiteral("rangeStart")).toDouble())},
+        {QStringLiteral("duration"), round3(m_beatAnalysis.value(QStringLiteral("rangeDuration")).toDouble())},
+        {QStringLiteral("bpm"), round2(m_beatAnalysisRaw.bpm)},
+        {QStringLiteral("confidence"), round2(m_beatAnalysisRaw.confidence)},
+        {QStringLiteral("beatsPerBar"), m_beatAnalysisRaw.beatsPerBar},
+        {QStringLiteral("firstDownbeat"), m_beatAnalysisRaw.firstDownbeat},
+        {QStringLiteral("beats"), beats},
+        {QStringLiteral("onsets"), onsetRows},
+        {QStringLiteral("truncated"), beats.size() < m_beatAnalysisRaw.beats.size()
+                                          || onsetRows.size() < m_beatAnalysisRaw.onsets.size()},
+        {QStringLiteral("gridVisible"), m_beatGridVisible},
+        {QStringLiteral("onsetsVisible"), m_onsetsVisible},
+    });
+}
+
+QJsonObject AppController::mcpDetectBeats(double startSeconds, double durSeconds, bool force)
+{
+    using namespace drift::mcp;
+    if (durSeconds < AudioOnsets::kMinAnalysisSec) {
+        return err("bad_args", QStringLiteral("duration must be >= %1 seconds to find a tempo")
+                                   .arg(AudioOnsets::kMinAnalysisSec));
+    }
+    if (durSeconds > kMcpMaxBeatSeconds) {
+        return err("bad_args",
+                   QStringLiteral("duration must be <= %1 seconds").arg(kMcpMaxBeatSeconds));
+    }
+
+    const double start = qMax(0.0, startSeconds);
+
+    // A cached grid is only reusable if the audio it describes has not moved since.
+    if (!force && !m_beatAnalysis.isEmpty()
+        && qFuzzyCompare(m_beatAnalysis.value(QStringLiteral("rangeStart")).toDouble() + 1.0,
+                         start + 1.0)
+        && qFuzzyCompare(m_beatAnalysis.value(QStringLiteral("rangeDuration")).toDouble() + 1.0,
+                         durSeconds + 1.0)
+        && m_beatAudioFingerprint == audioLayoutFingerprint()) {
+        QJsonObject cached = mcpBeatPayload();
+        cached.insert(QStringLiteral("cached"), true);
+        return cached;
+    }
+
+    // The editor may have started its own pass for the visible range. Two analyses fighting
+    // over one result slot would leave whichever finished second describing the other's range.
+    if (m_beatAnalysisRunning)
+        return err("conflict", QStringLiteral("A beat analysis is already running"));
+
+    const drift::TimeUs startUs = drift::secondsToUs(start);
+    const drift::TimeUs durUs = drift::secondsToUs(durSeconds);
+    const quint64 generation = ++m_beatAnalysisGeneration;
+
+    m_beatAnalysisRunning = true;
+    emit beatAnalysisChanged();
+
+    const drift::Project snap = m_project;
+    const QByteArray fingerprint = audioLayoutFingerprint();
+
+    auto analysis = std::make_shared<AudioBeatAnalysis>();
+    QEventLoop loop;
+    (void)QtConcurrent::run([snap, startUs, durUs, start, analysis, &loop]() {
+        *analysis = runBeatAnalysis(snap, startUs, durUs, start);
+        QMetaObject::invokeMethod(&loop, &QEventLoop::quit, Qt::QueuedConnection);
+    });
+    loop.exec();
+
+    // The nested loop kept the GUI live, so clearBeatAnalysis() or another pass could have run
+    // underneath us. Publishing now would resurrect a range the user already dismissed.
+    if (generation != m_beatAnalysisGeneration)
+        return err("conflict", QStringLiteral("Beat analysis was superseded"));
+
+    // applyBeatAnalysis is the shared publish path: it fills m_beatAnalysis, rebuilds the snap
+    // targets, stores the staleness fingerprint, clears the running flag and resumes any
+    // pending effect template.
+    applyBeatAnalysis(*analysis, start, durSeconds, fingerprint);
+
+    QJsonObject payload = mcpBeatPayload();
+    payload.insert(QStringLiteral("cached"), false);
+    return payload;
+}
+
+QJsonObject AppController::mcpSetBeatLayers(bool grid, bool onsets)
+{
+    using namespace drift::mcp;
+    setBeatGridVisible(grid);
+    setOnsetsVisible(onsets);
+    return ok({
+        {QStringLiteral("gridVisible"), m_beatGridVisible},
+        {QStringLiteral("onsetsVisible"), m_onsetsVisible},
+        {QStringLiteral("snapTargets"), static_cast<int>(m_beatSnapTargets.size())},
+        {QStringLiteral("snapEnabled"), m_snapEnabled},
+    });
+}
+
+QList<double> AppController::mcpBeatTimes(const QString &unit, double minStrength) const
+{
+    QList<double> times;
+    const QString u = unit.trimmed().toLower();
+
+    if (u == QLatin1String("onset")) {
+        for (const AudioOnset &o : m_beatAnalysisRaw.onsets) {
+            if (o.strength >= minStrength)
+                times.append(o.seconds);
+        }
+        return times;
+    }
+
+    const QList<double> &beats = m_beatAnalysisRaw.beats;
+    if (u == QLatin1String("bar")) {
+        const int per = qMax(1, m_beatAnalysisRaw.beatsPerBar);
+        // Count bars from the detected downbeat, not from index 0, or every bar line lands on
+        // whichever beat happened to be first in the analysed window.
+        const int first = qBound(0, m_beatAnalysisRaw.firstDownbeat, qMax(0, beats.size() - 1));
+        for (int i = first; i < beats.size(); i += per)
+            times.append(beats.at(i));
+        return times;
+    }
+
+    times = beats;
+    return times;
+}
+
+int AppController::mcpBookmarkBeats(double startSeconds, double durSeconds, const QString &unit,
+                                    double minStrength, const QString &labelPrefix)
+{
+    const QList<double> times = mcpBeatTimes(unit, minStrength);
+    if (times.isEmpty())
+        return 0;
+
+    const bool ranged = durSeconds > 0.0;
+    const double from = qMax(0.0, startSeconds);
+    const double to = from + durSeconds;
+
+    const drift::Project before = m_project;
+    QList<drift::Bookmark> marks = m_project.bookmarks();
+    int added = 0;
+    int n = 1;
+    for (double t : times) {
+        if (t < from || (ranged && t > to)) {
+            ++n;
+            continue;
+        }
+        const drift::TimeUs at = drift::secondsToUs(t);
+        // Bookmarks are snap targets themselves; stacking several inside one snap threshold
+        // would make the magnet ambiguous rather than stronger.
+        const bool crowded = std::any_of(marks.cbegin(), marks.cend(),
+                                         [at](const drift::Bookmark &b) {
+                                             return qAbs(b.timeUs - at) < drift::kSnapThresholdUs;
+                                         });
+        if (crowded) {
+            ++n;
+            continue;
+        }
+        marks.append(drift::Bookmark{at, QStringLiteral("%1 %2").arg(labelPrefix).arg(n)});
+        ++added;
+        ++n;
+    }
+    if (added == 0)
+        return 0;
+
+    std::sort(marks.begin(), marks.end(),
+              [](const drift::Bookmark &a, const drift::Bookmark &b) { return a.timeUs < b.timeUs; });
+    m_project.bookmarks() = marks;
+    pushProjectEdit(before, QStringLiteral("Bookmark beats"));
+    finishEdit(QStringLiteral("Bookmark beats"));
+    return added;
+}
+
+QJsonObject AppController::mcpSetClipVolume(int trackIndex, int clipIndex, double value,
+                                            bool atGiven, double atSeconds)
+{
+    using namespace drift::mcp;
+    if (trackIndex < 0 || trackIndex >= m_project.tracks().size())
+        return err("not_found", QStringLiteral("No such track"));
+    if (clipIndex < 0 || clipIndex >= m_project.tracks().at(trackIndex).clips.size())
+        return err("not_found", QStringLiteral("No such clip"));
+
+    const double clamped = qBound(0.0, value, 2.0);
+
+    // With a time, this is unambiguously a keyframe write and setClipKeyframe already forces
+    // one there.
+    if (atGiven) {
+        setClipKeyframe(trackIndex, clipIndex, QStringLiteral("volume"), atSeconds, clamped);
+    } else {
+        // Without one it is an ordinary level change, which is the slider's contract, not the
+        // diamond's: no key on an un-animated clip, retarget the only key on a clip that has
+        // one, and on a genuinely animated clip retarget whichever key is at the playhead.
+        const drift::Project before = m_project;
+        drift::Clip &clip = m_project.tracks()[trackIndex].clips[clipIndex];
+        const drift::TimeUs relative = qMax<drift::TimeUs>(0, m_playheadUs - clip.timelineStart);
+        if (!writeClipPropValue(clip, QStringLiteral("volume"), relative, clamped,
+                                /*autoKey=*/false, /*force=*/false)) {
+            return err("bad_args",
+                       QStringLiteral("Clip volume is animated and no key sits at the playhead — "
+                                      "pass `at` to write one, or seek to an existing key"));
+        }
+        pushProjectEdit(before, QStringLiteral("Set volume"));
+        finishEdit(QStringLiteral("Set volume"));
+    }
+
+    const drift::Clip &after = m_project.tracks().at(trackIndex).clips.at(clipIndex);
+    QJsonObject reply{
+        {QStringLiteral("id"), after.id},
+        {QStringLiteral("value"), round3(clamped)},
+        {QStringLiteral("volumeKeys"), after.volume.keyframes().size()},
+    };
+    if (!qFuzzyCompare(clamped + 1.0, value + 1.0))
+        reply.insert(QStringLiteral("clamped"), true);
+    return ok(reply);
+}
+
+QJsonObject AppController::mcpAudioSummary() const
+{
+    using namespace drift::mcp;
+    QJsonArray trackRows;
+    int audioClips = 0;
+
+    const QList<drift::Track> &tracks = m_project.tracks();
+    for (int t = 0; t < tracks.size(); ++t) {
+        const drift::Track &track = tracks.at(t);
+        // Same rule the mixer applies: audio clips always, video clips unless their embedded
+        // audio is suppressed. Anything else on the timeline is silent by construction.
+        if (track.type != drift::TrackType::Audio && track.type != drift::TrackType::Video)
+            continue;
+
+        QJsonArray clipRows;
+        for (int c = 0; c < track.clips.size(); ++c) {
+            const drift::Clip &clip = track.clips.at(c);
+            const bool carries = clip.type == drift::ClipType::Audio
+                                 || (clip.type == drift::ClipType::Video
+                                     && !clip.suppressEmbeddedAudio);
+            if (!carries)
+                continue;
+
+            if (m_assetLibrary)
+                m_assetLibrary->ensureAudioPresence(clip.assetId);
+            const drift::MediaAsset *asset = m_project.asset(clip.assetId);
+
+            QJsonObject row{
+                {QStringLiteral("clip"), clip.id},
+                {QStringLiteral("start"), round3(drift::usToSeconds(clip.timelineStart))},
+                {QStringLiteral("dur"), round3(drift::usToSeconds(clip.timelineDuration))},
+                {QStringLiteral("type"), drift::clipTypeToString(clip.type)},
+                {QStringLiteral("volumeKeys"), clip.volume.keyframes().size()},
+                {QStringLiteral("audioEffects"), clip.audioEffects.size()},
+            };
+            if (clip.fadeInUs > 0)
+                row.insert(QStringLiteral("fadeIn"), round3(drift::usToSeconds(clip.fadeInUs)));
+            if (clip.fadeOutUs > 0)
+                row.insert(QStringLiteral("fadeOut"), round3(drift::usToSeconds(clip.fadeOutUs)));
+            if (asset) {
+                row.insert(QStringLiteral("hasAudio"), asset->hasAudio);
+                if (asset->sampleRate > 0)
+                    row.insert(QStringLiteral("sampleRate"), asset->sampleRate);
+                if (asset->channels > 0)
+                    row.insert(QStringLiteral("channels"), asset->channels);
+            }
+            clipRows.append(row);
+            ++audioClips;
+        }
+
+        if (clipRows.isEmpty())
+            continue;
+        trackRows.append(QJsonObject{
+            {QStringLiteral("i"), t},
+            {QStringLiteral("type"), drift::trackTypeToString(track.type)},
+            {QStringLiteral("muted"), track.muted},
+            {QStringLiteral("items"), clipRows},
+        });
+    }
+
+    QJsonObject beats{
+        {QStringLiteral("analysed"), !m_beatAnalysis.isEmpty()},
+        {QStringLiteral("gridVisible"), m_beatGridVisible},
+        {QStringLiteral("onsetsVisible"), m_onsetsVisible},
+    };
+    if (!m_beatAnalysis.isEmpty()) {
+        beats.insert(QStringLiteral("bpm"), round2(m_beatAnalysisRaw.bpm));
+        beats.insert(QStringLiteral("stale"), m_beatAudioFingerprint != audioLayoutFingerprint());
+    }
+
+    return ok({
+        {QStringLiteral("sampleRate"), m_project.sampleRate()},
+        {QStringLiteral("dur"), round3(drift::usToSeconds(m_project.durationUs()))},
+        {QStringLiteral("audioClips"), audioClips},
+        {QStringLiteral("tracks"), trackRows},
+        {QStringLiteral("beats"), beats},
+    });
+}
+
+void AppController::mcpBeginBatch()
+{
+    if (m_mcpBatchDepth++ == 0) {
+        m_mcpBatchBefore = m_project.detachedCopy();
+        m_mcpUndoSuspended = true;
+    }
+}
+
+void AppController::mcpEndBatch(const QString &text, bool pushUndo)
+{
+    if (m_mcpBatchDepth <= 0)
+        return;
+    if (--m_mcpBatchDepth > 0)
+        return;
+    m_mcpUndoSuspended = false;
+    if (m_previewDragActive)
+        m_previewDragActive = false;
+    if (pushUndo)
+        pushProjectEdit(m_mcpBatchBefore, text);
+    finishEdit(text);
+    m_mcpBatchBefore = {};
 }
