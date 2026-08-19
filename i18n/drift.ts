@@ -426,7 +426,7 @@
 <context>
     <name>AppController</name>
     <message>
-        <location filename="../src/models/AppController.cpp" line="+1516"/>
+        <location filename="../src/models/AppController.cpp" line="+1546"/>
         <source>Media removed</source>
         <translation type="unfinished"></translation>
     </message>
@@ -471,12 +471,12 @@
     </message>
     <message>
         <location line="+133"/>
-        <location line="+8733"/>
+        <location line="+8763"/>
         <source>New project</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-8732"/>
+        <location line="-8762"/>
         <source>Open project</source>
         <translation type="unfinished"></translation>
     </message>
@@ -527,13 +527,13 @@
     </message>
     <message>
         <location line="+1"/>
-        <location line="+965"/>
+        <location line="+993"/>
         <location line="+1"/>
         <source>Split at current time</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-965"/>
+        <location line="-993"/>
         <source>Merge adjacent clips</source>
         <translation type="unfinished"></translation>
     </message>
@@ -589,18 +589,18 @@
     </message>
     <message>
         <location line="+1"/>
-        <location line="+7184"/>
+        <location line="+7214"/>
         <source>Mark work area in</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-7183"/>
-        <location line="+7197"/>
+        <location line="-7213"/>
+        <location line="+7227"/>
         <source>Mark work area out</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-7196"/>
+        <location line="-7226"/>
         <source>Go to work area in</source>
         <translation type="unfinished"></translation>
     </message>
@@ -611,12 +611,12 @@
     </message>
     <message>
         <location line="+1"/>
-        <location line="+7220"/>
+        <location line="+7250"/>
         <source>Clear work area</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-7219"/>
+        <location line="-7249"/>
         <source>Loop work area playback</source>
         <translation type="unfinished"></translation>
     </message>
@@ -632,11 +632,12 @@
     </message>
     <message>
         <location line="+204"/>
+        <location line="+218"/>
         <source>System default</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+422"/>
+        <location line="+232"/>
         <location line="+1"/>
         <location line="+116"/>
         <location line="+1"/>
@@ -780,7 +781,7 @@
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+12"/>
+        <location line="+13"/>
         <source>Subtitle generation already in progress</source>
         <translation type="unfinished"></translation>
     </message>
@@ -796,7 +797,7 @@
     </message>
     <message>
         <location line="+9"/>
-        <location line="+1502"/>
+        <location line="+1503"/>
         <location line="+74"/>
         <source>Starting…</source>
         <translation type="unfinished"></translation>
@@ -1114,7 +1115,7 @@
         <translation type="unfinished"></translation>
     </message>
     <message numerus="yes">
-        <location line="-1655"/>
+        <location line="-1657"/>
         <location line="+42"/>
         <source>Imported %n subtitles</source>
         <translation type="unfinished">
@@ -1123,12 +1124,17 @@
         </translation>
     </message>
     <message>
-        <location line="+90"/>
+        <location line="-3151"/>
+        <source>No audio output devices were found, so playback will be silent.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+3242"/>
         <source>Creating captions…</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+869"/>
+        <location line="+870"/>
         <source>Cutting out subject…</source>
         <translation type="unfinished"></translation>
     </message>
@@ -2442,7 +2448,22 @@
 <context>
     <name>AudioInspector</name>
     <message>
-        <location filename="../src/qml/components/properties/AudioInspector.qml" line="+41"/>
+        <location filename="../src/qml/components/properties/AudioInspector.qml" line="+22"/>
+        <source>Recommended caption length</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>1 word per caption</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+2"/>
+        <source>%1 words per caption</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+26"/>
         <source>No audio</source>
         <translation type="unfinished"></translation>
     </message>
@@ -2468,17 +2489,22 @@
     </message>
     <message>
         <location line="+1"/>
-        <location line="+77"/>
+        <location line="+100"/>
         <source>Install AI engine first</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-60"/>
+        <location line="-83"/>
         <source>Auto subtitles</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+42"/>
+        <location line="+53"/>
+        <source>Shorter captions are timed by splitting each phrase evenly, so they can drift slightly out of sync with the speech.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+11"/>
         <source>Creating captions… %1%</source>
         <translation type="unfinished"></translation>
     </message>
@@ -2488,8 +2514,36 @@
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+16"/>
+        <location line="+17"/>
         <source>Download speech recognition (about 670 MB)</source>
+        <translation type="unfinished"></translation>
+    </message>
+</context>
+<context>
+    <name>AudioOutputChannel</name>
+    <message>
+        <location filename="../src/playback/AudioOutputChannel.cpp" line="+14"/>
+        <source>The audio device could not be opened. Another program may be using it exclusively.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+3"/>
+        <source>The audio device stopped responding.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+2"/>
+        <source>The audio device was disconnected.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+250"/>
+        <source>No audio output device is available.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>The audio device does not support playback of this project.</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -3187,7 +3241,7 @@
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+105"/>
+        <location line="+133"/>
         <source>No emoji match “%1”.</source>
         <translation type="unfinished"></translation>
     </message>
@@ -3759,7 +3813,7 @@
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+313"/>
+        <location line="+321"/>
         <source>Move keyframe</source>
         <translation type="unfinished"></translation>
     </message>
@@ -4025,11 +4079,16 @@
     </message>
     <message>
         <location line="+10"/>
-        <source>Hides everything outside the shape. Feather softens its edge.</source>
+        <source>Coming soon — shape masks are still under development.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+15"/>
+        <location line="+27"/>
+        <source>Shape masks are still under development</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="-9"/>
         <source>None</source>
         <translation type="unfinished"></translation>
     </message>
@@ -4064,12 +4123,7 @@
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+3"/>
-        <source>Shape used to cut out this clip</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+14"/>
+        <location line="+17"/>
         <source>Remove cutout</source>
         <translation type="unfinished"></translation>
     </message>
@@ -4698,7 +4752,7 @@ Quality: renders and shows every single frame, silently and slower than real tim
 <context>
     <name>PropertyKeyframeRow</name>
     <message>
-        <location filename="../src/qml/components/PropertyKeyframeRow.qml" line="+160"/>
+        <location filename="../src/qml/components/PropertyKeyframeRow.qml" line="+220"/>
         <source>%1 has no keyframes yet</source>
         <translation type="unfinished"></translation>
     </message>
@@ -4743,17 +4797,28 @@ Quality: renders and shows every single frame, silently and slower than real tim
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+27"/>
+        <location line="+31"/>
+        <source>Previous keyframe</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+14"/>
         <source>Remove %1&apos;s keyframe at the playhead</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
         <location line="+1"/>
+        <location line="+34"/>
         <source>Add a keyframe for %1 at the playhead</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+90"/>
+        <location line="-16"/>
+        <source>Next keyframe</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+100"/>
         <source>Edit %1</source>
         <translation type="unfinished"></translation>
     </message>
@@ -5261,12 +5326,12 @@ Quality: renders and shows every single frame, silently and slower than real tim
     </message>
     <message>
         <location line="+30"/>
-        <location line="+330"/>
+        <location line="+354"/>
         <source>Choose background colour</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-307"/>
+        <location line="-331"/>
         <source>Enter a color like #FF0000</source>
         <translation type="unfinished"></translation>
     </message>
@@ -5277,7 +5342,17 @@ Quality: renders and shows every single frame, silently and slower than real tim
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+16"/>
+        <location line="+14"/>
+        <source>Audio output</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+12"/>
+        <source>Where playback is heard. “System default” follows whatever your computer is set to, including when that changes.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+14"/>
         <source>Updates</source>
         <translation type="unfinished"></translation>
     </message>
@@ -6342,12 +6417,12 @@ Quality: renders and shows every single frame, silently and slower than real tim
     </message>
     <message>
         <location line="+17"/>
-        <location line="+34"/>
+        <location line="+55"/>
         <source>Add auto caption</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-24"/>
+        <location line="-45"/>
         <source>Creates captions from the speech in the selected clip.</source>
         <translation type="unfinished"></translation>
     </message>
@@ -6357,7 +6432,12 @@ Quality: renders and shows every single frame, silently and slower than real tim
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+27"/>
+        <location line="+35"/>
+        <source>Shorter captions are timed by splitting each phrase evenly, so they can drift slightly out of sync with the speech.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+13"/>
         <source>Create captions from the selected clip&apos;s speech</source>
         <translation type="unfinished"></translation>
     </message>
@@ -6367,7 +6447,7 @@ Quality: renders and shows every single frame, silently and slower than real tim
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+20"/>
+        <location line="+21"/>
         <source>Creating captions… %1%</source>
         <translation type="unfinished"></translation>
     </message>
@@ -6394,6 +6474,21 @@ Quality: renders and shows every single frame, silently and slower than real tim
     <message>
         <location line="+3"/>
         <source>Needed for auto captions from speech</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+10"/>
+        <source>Recommended caption length</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>1 word per caption</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+2"/>
+        <source>%1 words per caption</source>
         <translation type="unfinished"></translation>
     </message>
 </context>

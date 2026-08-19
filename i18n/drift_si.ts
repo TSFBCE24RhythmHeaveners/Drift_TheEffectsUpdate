@@ -426,7 +426,7 @@
 <context>
     <name>AppController</name>
     <message>
-        <location filename="../src/models/AppController.cpp" line="+1516"/>
+        <location filename="../src/models/AppController.cpp" line="+1546"/>
         <source>Media removed</source>
         <translation>මාධ්‍ය ඉවත් කරන ලදී</translation>
     </message>
@@ -471,12 +471,12 @@
     </message>
     <message>
         <location line="+133"/>
-        <location line="+8733"/>
+        <location line="+8763"/>
         <source>New project</source>
         <translation>නව ව්‍යාපෘතිය</translation>
     </message>
     <message>
-        <location line="-8732"/>
+        <location line="-8762"/>
         <source>Open project</source>
         <translation>ව්‍යාපෘතිය විවෘත කරන්න</translation>
     </message>
@@ -527,13 +527,13 @@
     </message>
     <message>
         <location line="+1"/>
-        <location line="+965"/>
+        <location line="+993"/>
         <location line="+1"/>
         <source>Split at current time</source>
         <translation>වත්මන් වේලාවේදී වෙන් කරන්න</translation>
     </message>
     <message>
-        <location line="-965"/>
+        <location line="-993"/>
         <source>Merge adjacent clips</source>
         <translation>යාබද ක්ලිප් ඒකාබද්ධ කරන්න</translation>
     </message>
@@ -589,18 +589,18 @@
     </message>
     <message>
         <location line="+1"/>
-        <location line="+7184"/>
+        <location line="+7214"/>
         <source>Mark work area in</source>
         <translation>වැඩ කලාපයේ ආරම්භය සලකුණු කරන්න (In)</translation>
     </message>
     <message>
-        <location line="-7183"/>
-        <location line="+7197"/>
+        <location line="-7213"/>
+        <location line="+7227"/>
         <source>Mark work area out</source>
         <translation>වැඩ කලාපයේ අවසානය සලකුණු කරන්න (Out)</translation>
     </message>
     <message>
-        <location line="-7196"/>
+        <location line="-7226"/>
         <source>Go to work area in</source>
         <translation>වැඩ කලාපයේ ආරම්භයට යන්න</translation>
     </message>
@@ -611,12 +611,12 @@
     </message>
     <message>
         <location line="+1"/>
-        <location line="+7220"/>
+        <location line="+7250"/>
         <source>Clear work area</source>
         <translation>වැඩ කලාපය හිස් කරන්න</translation>
     </message>
     <message>
-        <location line="-7219"/>
+        <location line="-7249"/>
         <source>Loop work area playback</source>
         <translation>වැඩ කලාපය ලූපයක් සේ ධාවනය කරන්න</translation>
     </message>
@@ -632,11 +632,12 @@
     </message>
     <message>
         <location line="+204"/>
+        <location line="+218"/>
         <source>System default</source>
         <translation>පද්ධති පෙරනිමිය</translation>
     </message>
     <message>
-        <location line="+422"/>
+        <location line="+232"/>
         <location line="+1"/>
         <location line="+116"/>
         <location line="+1"/>
@@ -780,7 +781,7 @@
         <translation>ස්වයංක්‍රීයව හඳුනාගන්න</translation>
     </message>
     <message>
-        <location line="+12"/>
+        <location line="+13"/>
         <source>Subtitle generation already in progress</source>
         <translation>උපසිරැසි ජනනය දැනටමත් සිදුවෙමින් පවතී</translation>
     </message>
@@ -796,7 +797,7 @@
     </message>
     <message>
         <location line="+9"/>
-        <location line="+1502"/>
+        <location line="+1503"/>
         <location line="+74"/>
         <source>Starting…</source>
         <translation>ආරම්භ කරමින්…</translation>
@@ -1114,7 +1115,7 @@
         <translation>සූදානම්</translation>
     </message>
     <message numerus="yes">
-        <location line="-1655"/>
+        <location line="-1657"/>
         <location line="+42"/>
         <source>Imported %n subtitles</source>
         <translation>
@@ -1123,12 +1124,17 @@
         </translation>
     </message>
     <message>
-        <location line="+90"/>
+        <location line="-3151"/>
+        <source>No audio output devices were found, so playback will be silent.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+3242"/>
         <source>Creating captions…</source>
         <translation>උපසිරැසි නිර්මාණය කරමින්…</translation>
     </message>
     <message>
-        <location line="+869"/>
+        <location line="+870"/>
         <source>Cutting out subject…</source>
         <translation>විෂයය වෙන් කරමින්…</translation>
     </message>
@@ -2442,7 +2448,22 @@
 <context>
     <name>AudioInspector</name>
     <message>
-        <location filename="../src/qml/components/properties/AudioInspector.qml" line="+41"/>
+        <location filename="../src/qml/components/properties/AudioInspector.qml" line="+22"/>
+        <source>Recommended caption length</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>1 word per caption</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+2"/>
+        <source>%1 words per caption</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+26"/>
         <source>No audio</source>
         <translation>ශ්‍රව්‍ය නැත</translation>
     </message>
@@ -2468,17 +2489,22 @@
     </message>
     <message>
         <location line="+1"/>
-        <location line="+77"/>
+        <location line="+100"/>
         <source>Install AI engine first</source>
         <translation>පළමුව AI එන්ජිම ස්ථාපනය කරන්න</translation>
     </message>
     <message>
-        <location line="-60"/>
+        <location line="-83"/>
         <source>Auto subtitles</source>
         <translation>ස්වයංක්‍රීය උපසිරැසි</translation>
     </message>
     <message>
-        <location line="+42"/>
+        <location line="+53"/>
+        <source>Shorter captions are timed by splitting each phrase evenly, so they can drift slightly out of sync with the speech.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+11"/>
         <source>Creating captions… %1%</source>
         <translation>උපසිරැසි සාදමින්… %1%</translation>
     </message>
@@ -2488,9 +2514,37 @@
         <translation>කථනයෙන් උපසිරැසි සාදන්න</translation>
     </message>
     <message>
-        <location line="+16"/>
+        <location line="+17"/>
         <source>Download speech recognition (about 670 MB)</source>
         <translation>කථන හඳුනාගැනීම බාගන්න (මෙගාබයිට් 670ක් පමණ)</translation>
+    </message>
+</context>
+<context>
+    <name>AudioOutputChannel</name>
+    <message>
+        <location filename="../src/playback/AudioOutputChannel.cpp" line="+14"/>
+        <source>The audio device could not be opened. Another program may be using it exclusively.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+3"/>
+        <source>The audio device stopped responding.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+2"/>
+        <source>The audio device was disconnected.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+250"/>
+        <source>No audio output device is available.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>The audio device does not support playback of this project.</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -3187,7 +3241,7 @@
         <translation>සොයන්න</translation>
     </message>
     <message>
-        <location line="+105"/>
+        <location line="+133"/>
         <source>No emoji match “%1”.</source>
         <translation>“%1” ට ගැලපෙන ඉමෝජි නැත.</translation>
     </message>
@@ -3759,7 +3813,7 @@
         <translation> · කිසිදු බීට් එකක් හමු නොවීය</translation>
     </message>
     <message>
-        <location line="+313"/>
+        <location line="+321"/>
         <source>Move keyframe</source>
         <translation>කීෆ්‍රේමය ගෙනයන්න</translation>
     </message>
@@ -4025,11 +4079,16 @@
     </message>
     <message>
         <location line="+10"/>
-        <source>Hides everything outside the shape. Feather softens its edge.</source>
-        <translation>හැඩතලයෙන් පිටත ඇති සියල්ල සඟවයි. Feather මඟින් එහි දාර මෘදු කරයි.</translation>
+        <source>Coming soon — shape masks are still under development.</source>
+        <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+15"/>
+        <location line="+27"/>
+        <source>Shape masks are still under development</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="-9"/>
         <source>None</source>
         <translation>කිසිවක් නැත</translation>
     </message>
@@ -4064,12 +4123,7 @@
         <translation>නිදහස් හැඩය (Freeform)</translation>
     </message>
     <message>
-        <location line="+3"/>
-        <source>Shape used to cut out this clip</source>
-        <translation>මෙම ක්ලිපය වෙන් කිරීමට භාවිත කළ හැඩතලය</translation>
-    </message>
-    <message>
-        <location line="+14"/>
+        <location line="+17"/>
         <source>Remove cutout</source>
         <translation>Cutout ඉවත් කරන්න</translation>
     </message>
@@ -4702,7 +4756,7 @@ Quality: තථ්‍ය කාලයට වඩා සෙමින්, ශබ්
 <context>
     <name>PropertyKeyframeRow</name>
     <message>
-        <location filename="../src/qml/components/PropertyKeyframeRow.qml" line="+160"/>
+        <location filename="../src/qml/components/PropertyKeyframeRow.qml" line="+220"/>
         <source>%1 has no keyframes yet</source>
         <translation>%1 හි තවමත් කීෆ්‍රේම නැත</translation>
     </message>
@@ -4747,17 +4801,28 @@ Quality: තථ්‍ය කාලයට වඩා සෙමින්, ශබ්
         <translation>Jump — ඊළඟ කීෆ්‍රේමය තෙක් අගය රඳවා තබා ගනී</translation>
     </message>
     <message>
-        <location line="+27"/>
+        <location line="+31"/>
+        <source>Previous keyframe</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+14"/>
         <source>Remove %1&apos;s keyframe at the playhead</source>
         <translation>ධාවන ශීර්ෂයේ ඇති %1 හි කීෆ්‍රේමය ඉවත් කරන්න</translation>
     </message>
     <message>
         <location line="+1"/>
+        <location line="+34"/>
         <source>Add a keyframe for %1 at the playhead</source>
         <translation>ධාවන ශීර්ෂයේදී %1 සඳහා කීෆ්‍රේමයක් එක් කරන්න</translation>
     </message>
     <message>
-        <location line="+90"/>
+        <location line="-16"/>
+        <source>Next keyframe</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+100"/>
         <source>Edit %1</source>
         <translation>%1 සංස්කරණය කරන්න</translation>
     </message>
@@ -5266,12 +5331,12 @@ Quality: තථ්‍ය කාලයට වඩා සෙමින්, ශබ්
     </message>
     <message>
         <location line="+30"/>
-        <location line="+330"/>
+        <location line="+354"/>
         <source>Choose background colour</source>
         <translation>පසුබිම් වර්ණය තෝරන්න</translation>
     </message>
     <message>
-        <location line="-307"/>
+        <location line="-331"/>
         <source>Enter a color like #FF0000</source>
         <translation>#FF0000 වැනි වර්ණ කේතයක් ඇතුළත් කරන්න</translation>
     </message>
@@ -5282,7 +5347,17 @@ Quality: තථ්‍ය කාලයට වඩා සෙමින්, ශබ්
         <translation>බොඳ කිරීමේ ප්‍රබලතාව</translation>
     </message>
     <message>
-        <location line="+16"/>
+        <location line="+14"/>
+        <source>Audio output</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+12"/>
+        <source>Where playback is heard. “System default” follows whatever your computer is set to, including when that changes.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+14"/>
         <source>Updates</source>
         <translation>යාවත්කාලීන</translation>
     </message>
@@ -6347,12 +6422,12 @@ Quality: තථ්‍ය කාලයට වඩා සෙමින්, ශබ්
     </message>
     <message>
         <location line="+17"/>
-        <location line="+34"/>
+        <location line="+55"/>
         <source>Add auto caption</source>
         <translation>ස්වයංක්‍රීය උපසිරැසි එක් කරන්න</translation>
     </message>
     <message>
-        <location line="-24"/>
+        <location line="-45"/>
         <source>Creates captions from the speech in the selected clip.</source>
         <translation>තෝරාගත් ක්ලිපයේ කථනයෙන් උපසිරැසි නිර්මාණය කරයි.</translation>
     </message>
@@ -6362,7 +6437,12 @@ Quality: තථ්‍ය කාලයට වඩා සෙමින්, ශබ්
         <translation>පළමුව කාලරේඛාවේ වීඩියෝ හෝ ශ්‍රව්‍ය ක්ලිපයක් තෝරන්න.</translation>
     </message>
     <message>
-        <location line="+27"/>
+        <location line="+35"/>
+        <source>Shorter captions are timed by splitting each phrase evenly, so they can drift slightly out of sync with the speech.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+13"/>
         <source>Create captions from the selected clip&apos;s speech</source>
         <translation>තෝරාගත් ක්ලිපයේ කථනයෙන් උපසිරැසි සාදන්න</translation>
     </message>
@@ -6372,7 +6452,7 @@ Quality: තථ්‍ය කාලයට වඩා සෙමින්, ශබ්
         <translation>පළමුව වීඩියෝ හෝ ශ්‍රව්‍ය ක්ලිපයක් තෝරන්න</translation>
     </message>
     <message>
-        <location line="+20"/>
+        <location line="+21"/>
         <source>Creating captions… %1%</source>
         <translation>උපසිරැසි සාදමින්… %1%</translation>
     </message>
@@ -6400,6 +6480,21 @@ Quality: තථ්‍ය කාලයට වඩා සෙමින්, ශබ්
         <location line="+3"/>
         <source>Needed for auto captions from speech</source>
         <translation>කථනයෙන් ස්වයංක්‍රීය උපසිරැසි ලබාගැනීමට අවශ්‍ය වේ</translation>
+    </message>
+    <message>
+        <location line="+10"/>
+        <source>Recommended caption length</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>1 word per caption</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+2"/>
+        <source>%1 words per caption</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
