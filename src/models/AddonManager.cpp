@@ -9,6 +9,7 @@
 #include "engine/EffectTemplateCatalog.h"
 #include "engine/EmojiCatalog.h"
 #include "engine/FontCatalog.h"
+#include "engine/FacePropCatalog.h"
 #include "engine/OrtRuntime.h"
 #include "engine/StickerCatalog.h"
 #include "engine/TransitionCatalog.h"
@@ -619,6 +620,8 @@ void AddonManager::reloadForKinds(const QStringList &kinds)
             reloadFontCatalog();
         else if (kind == QLatin1String("stickers"))
             reloadStickerCatalog();
+        else if (kind == QLatin1String("face-props"))
+            reloadFacePropCatalog();
         else if (kind == QLatin1String("emoji-font"))
             reloadEmojiCatalog();
         else if (kind == QLatin1String("effects"))
@@ -637,8 +640,8 @@ void AddonManager::reloadForKinds(const QStringList &kinds)
             if (!drift::ort::activeVariant().isEmpty())
                 m_runtimeRestartRequired = true;
         }
-        // whisper-model, sam2-model and face-model need nothing: sessions are created lazily on
-        // next use.
+        // whisper-model, sam2-model, face-model and object-model need nothing: sessions are
+        // created lazily on next use.
         emit kindChanged(kind);
     }
 }

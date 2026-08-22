@@ -6,7 +6,7 @@ set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "Oldest macOS release Drift 
 
 # C is enabled for JUCE only: its modules compile a handful of C sources (zlib, flac, oggvorbis)
 # and its CMake refuses to configure without it.
-project(Drift VERSION 0.2.2 LANGUAGES CXX C)
+project(Drift VERSION 0.3.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -353,6 +353,10 @@ add_library(driftengine STATIC
     src/engine/WaveformBlockCache.cpp
     src/engine/AudioOnsets.h
     src/engine/AudioOnsets.cpp
+    src/engine/SceneDetect.h
+    src/engine/SceneDetect.cpp
+    src/engine/ObjectDetector.h
+    src/engine/ObjectDetector.cpp
     src/engine/Exporter.h
     src/engine/Exporter.cpp
     src/engine/ClipReader.h
@@ -415,6 +419,16 @@ add_library(driftengine STATIC
     src/engine/FaceLandmarker.cpp
     src/engine/FaceTrack.h
     src/engine/FaceTrack.cpp
+    src/engine/FaceModelTransform.h
+    src/engine/FaceModelTransform.cpp
+    src/engine/FaceMesh.h
+    src/engine/FaceMesh.cpp
+    src/engine/ModelAsset.h
+    src/engine/ModelAsset.cpp
+    src/engine/GlModelRenderer.h
+    src/engine/GlModelRenderer.cpp
+    src/engine/FacePropCatalog.h
+    src/engine/FacePropCatalog.cpp
     src/engine/DeepFilterDenoiser.h
     src/engine/DeepFilterDenoiser.cpp
     src/engine/MatteWriter.h
@@ -431,6 +445,8 @@ add_library(driftengine STATIC
     src/engine/ProjectDependencies.cpp
 )
 target_include_directories(driftengine PUBLIC src)
+# cgltf is PRIVATE: ModelAsset.h exposes no cgltf type, so nothing outside ModelAsset.cpp includes it.
+target_include_directories(driftengine SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/third_party/cgltf)
 target_link_libraries(driftengine PUBLIC Qt6::Core Qt6::Gui Qt6::OpenGL FFmpeg::FFmpeg driftcore
     driftaudiodsp onnxruntime::headers)
 target_link_libraries(driftengine PRIVATE ${DRIFT_ZSTD_TARGET} OpenSSL::Crypto ${CMAKE_DL_LIBS})
@@ -455,6 +471,10 @@ qt_add_executable(drift
     src/ClipPreviewImageProvider.cpp
     src/ClipPreviewImageStore.h
     src/ClipPreviewImageStore.cpp
+    src/MulticamImageProvider.h
+    src/MulticamImageProvider.cpp
+    src/MulticamImageStore.h
+    src/MulticamImageStore.cpp
     src/TextStylePreviewImageProvider.h
     src/TextStylePreviewImageProvider.cpp
     src/models/AddonEndpoint.h
@@ -466,6 +486,8 @@ qt_add_executable(drift
     src/models/AppController.h
     src/models/AppController.cpp
     src/models/EditorState.h
+    src/models/LayoutStore.h
+    src/models/LayoutStore.cpp
     src/models/FileDialogs.h
     src/models/FileDialogs.cpp
     src/models/AssetLibrary.h
@@ -571,6 +593,7 @@ qt_add_qml_module(drift
         src/qml/components/preview/CropOverlay.qml
         src/qml/components/preview/PreviewToolbar.qml
         src/qml/SegmentationWindow.qml
+        src/qml/MulticamWindow.qml
         src/qml/DenoiseWindow.qml
         src/qml/SpeedCurveWindow.qml
         src/qml/FadeCurveWindow.qml
@@ -588,6 +611,7 @@ qt_add_qml_module(drift
         src/qml/components/properties/MasksInspector.qml
         src/qml/components/properties/EffectsInspector.qml
         src/qml/components/assets/TextAssetsTab.qml
+        src/qml/components/assets/ScenesTab.qml
         src/qml/components/assets/SubtitlesTab.qml
         src/qml/components/assets/StickersTab.qml
         src/qml/components/assets/ShapesTab.qml
@@ -713,7 +737,10 @@ if(Qt6LinguistTools_FOUND)
             src/core/ShapeStyle.cpp
             src/core/TextStyle.cpp
             src/core/SubtitleCue.cpp
-        LUPDATE_OPTIONS -no-obsolete -locations relative
+        # -locations none: source line numbers in .ts files churn on every edit
+        # and make i18n/*.ts conflict across PRs. Translators still see context
+        # and source text; they lose jump-to-source in Qt Linguist.
+        LUPDATE_OPTIONS -no-obsolete -locations none
     )
     if(NOT TARGET update_translations AND TARGET drift_lupdate)
         add_custom_target(update_translations DEPENDS drift_lupdate)
@@ -855,6 +882,8 @@ else()
             DESTINATION ${CMAKE_INSTALL_DATADIR}/applications COMPONENT drift)
     install(FILES flatpak/org.cutwire.Drift.metainfo.xml
             DESTINATION ${CMAKE_INSTALL_DATADIR}/metainfo COMPONENT drift)
+    install(FILES flatpak/org.cutwire.Drift.xml
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/mime/packages COMPONENT drift)
     # 1024px source is intentionally skipped: flatpak build-export rejects icons
     # larger than 512x512.
     foreach(_size 64 128 256 512)

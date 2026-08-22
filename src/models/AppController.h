@@ -1,8 +1,10 @@
 #pragma once
 
 #include "core/Project.h"
+#include "core/TimelineOps.h"
 #include "core/Time.h"
 #include "engine/AudioOnsets.h"
+#include "engine/SceneDetect.h"
 #include "engine/FilmstripTileCache.h"
 #include "engine/MediaWaveform.h"
 #include "engine/WaveformBlockCache.h"
@@ -13,12 +15,14 @@
 #include "models/AssetLibrary.h"
 
 #include <QAtomicInt>
+#include <QFuture>
 #include <QHash>
 #include <QJsonObject>
 #include <QMediaDevices>
 #include <QObject>
 #include <QPair>
 #include <QSet>
+#include <QStringList>
 #include <QUndoStack>
 #include <QUrl>
 #include <QVariantList>
@@ -139,6 +143,22 @@ class AppController : public QObject
     Q_PROPERTY(int segmentRevision READ segmentRevision NOTIFY segmentSessionChanged)
     Q_PROPERTY(QVariantList segmentPoints READ segmentPoints NOTIFY segmentSessionChanged)
     Q_PROPERTY(QSize segmentFrameSize READ segmentFrameSize NOTIFY segmentSessionChanged)
+    // Multicam punching session. The live project is not touched until Save; switches rewrite a
+    // staged copy that playback is pointed at so the program monitor shows the mix.
+    Q_PROPERTY(bool multicamActive READ multicamActive NOTIFY multicamChanged)
+    // One entry per selected camera: {trackIndex, label, clipName, hasClip, active}.
+    Q_PROPERTY(QVariantList multicamAngles READ multicamAngles NOTIFY multicamChanged)
+    // Index into multicamAngles assigned at the playhead; -1 outside the session range.
+    Q_PROPERTY(int multicamActiveAngle READ multicamActiveAngle NOTIFY multicamChanged)
+    // Bumped whenever a fresh set of tiles lands; QML appends it as ?rev= to defeat the
+    // URL-keyed image cache, the same way the segmentation window does.
+    Q_PROPERTY(int multicamRevision READ multicamRevision NOTIFY multicamFramesChanged)
+    // Staged program as a single lane: {start, duration, name, angle}. Empty before a session
+    // has cameras.
+    Q_PROPERTY(QVariantList multicamProgramClips READ multicamProgramClips NOTIFY multicamChanged)
+    // There is enough imported video to build a rig from, and no visual clips that building one
+    // would disturb. Drives the window's "set this up for me" offer.
+    Q_PROPERTY(bool multicamCanSetUp READ multicamCanSetUp NOTIFY multicamChanged)
     Q_PROPERTY(bool speedCurveSessionActive READ speedCurveSessionActive NOTIFY speedCurveSessionChanged)
     Q_PROPERTY(QVariantList speedCurvePoints READ speedCurvePoints NOTIFY speedCurveChanged)
     Q_PROPERTY(int speedCurveRevision READ speedCurveRevision NOTIFY speedCurveFrameChanged)
@@ -164,6 +184,16 @@ class AppController : public QObject
     Q_PROPERTY(bool faceDetecting READ faceDetecting NOTIFY faceDetectingChanged)
     Q_PROPERTY(double faceDetectProgress READ faceDetectProgress NOTIFY faceDetectProgressChanged)
     Q_PROPERTY(QString faceDetectStatus READ faceDetectStatus NOTIFY faceDetectStatusChanged)
+    // Detected shots for the clip named by sceneClipId. Analysis state, not project state:
+    // it describes the source media, so it is cached on disk rather than saved (see
+    // engine/SceneDetect.h) and is never pushed through the undo stack.
+    Q_PROPERTY(QVariantList scenes READ scenes NOTIFY scenesChanged)
+    Q_PROPERTY(QString sceneClipId READ sceneClipId NOTIFY scenesChanged)
+    // Source file the live analysis describes, so the panel can ask for thumbnails.
+    Q_PROPERTY(QString sceneClipPath READ sceneClipPath NOTIFY scenesChanged)
+    Q_PROPERTY(bool sceneDetecting READ sceneDetecting NOTIFY sceneDetectingChanged)
+    Q_PROPERTY(double sceneDetectProgress READ sceneDetectProgress NOTIFY sceneDetectProgressChanged)
+    Q_PROPERTY(QString sceneDetectStatus READ sceneDetectStatus NOTIFY sceneDetectStatusChanged)
     Q_PROPERTY(int selectedTrack READ selectedTrack NOTIFY selectionChanged)
     Q_PROPERTY(int selectedClip READ selectedClip NOTIFY selectionChanged)
     Q_PROPERTY(QVariantList selection READ selection NOTIFY selectionChanged)
@@ -274,6 +304,12 @@ public:
     bool faceDetecting() const { return m_faceDetecting; }
     double faceDetectProgress() const { return m_faceDetectProgress; }
     QString faceDetectStatus() const { return m_faceDetectStatus; }
+    QVariantList scenes() const { return m_scenes; }
+    QString sceneClipId() const { return m_sceneClipId; }
+    QString sceneClipPath() const { return m_sceneClipPath; }
+    bool sceneDetecting() const { return m_sceneDetecting; }
+    double sceneDetectProgress() const { return m_sceneDetectProgress; }
+    QString sceneDetectStatus() const { return m_sceneDetectStatus; }
     int selectedTrack() const { return m_selectedTrack; }
     int selectedClip() const { return m_selectedClip; }
     QVariantList selection() const;
@@ -353,6 +389,23 @@ public:
     // Grid times from the current analysis. `unit` is beat, bar or onset; `minStrength` filters
     // onsets only. Empty when nothing has been analysed yet.
     QList<double> mcpBeatTimes(const QString &unit, double minStrength) const;
+    // --- scene toolbox ---
+    QJsonObject mcpDetectScenes(int trackIndex, int clipIndex, double threshold, double minScene,
+                                bool withObjects);
+    // The live analysis, filtered and shaped for MCP. Times are reported in both source and
+    // timeline space so an agent never has to redo the trim/speed/reverse mapping itself.
+    QJsonObject mcpListScenes(const QString &label, double minScore, const QString &sort,
+                              int limit) const;
+    QJsonObject mcpDescribeClip(int topCount) const;
+    QJsonObject mcpFindScenes(const QString &label, double minScore, int trackIndex,
+                              int limit) const;
+    // Timeline seconds of every detected boundary inside the clip that was analysed.
+    QList<double> mcpSceneCutTimes(double minScore, const QString &label) const;
+    int mcpBookmarkScenes(double minScore, const QString &label, const QString &labelPrefix);
+    // Which model addons are installed, so an agent can say what to install rather than
+    // retrying blindly.
+    QJsonObject mcpAiCapabilities() const;
+
     int mcpBookmarkBeats(double startSeconds, double durSeconds, const QString &unit,
                          double minStrength, const QString &labelPrefix);
     QJsonObject mcpSetBeatLayers(bool grid, bool onsets);
@@ -424,6 +477,25 @@ public:
     Q_INVOKABLE void endSegmentationSession();
     void openSegmentationForTemplate(int trackIndex, int clipIndex);
 
+    // Starts a punching session from the current video selection (two or more clips on
+    // distinct tracks). Returns false when there is nothing to punch and no empty-timeline
+    // setup to offer; the window should stay closed.
+    Q_INVOKABLE bool beginMulticamSession();
+    Q_INVOKABLE void endMulticamSession();
+    bool multicamActive() const { return m_multicamActive; }
+    QVariantList multicamAngles() const;
+    int multicamActiveAngle() const;
+    int multicamRevision() const { return m_multicamRevision; }
+    QVariantList multicamProgramClips() const;
+    bool multicamCanSetUp() const;
+    // One video track per imported camera, stacked from the top, extras muted. One undoable
+    // edit; if a session is already open it then snapshots those clips as the cameras.
+    Q_INVOKABLE void setUpMulticamFromAssets();
+    // Punch `angleIndex` at the playhead on the staged copy. The live project is untouched.
+    Q_INVOKABLE void switchMulticamAngle(int angleIndex);
+    Q_INVOKABLE void saveMulticamAsSeparateTracks();
+    Q_INVOKABLE void saveMulticamCombined();
+
     // Speed-curve editing session driving SpeedCurveWindow. The curve is held here as a
     // candidate and auditioned through a private single-clip player; the project is not touched
     // until applySpeedCurve mints the retimed copy.
@@ -481,6 +553,24 @@ public:
     Q_INVOKABLE void cancelFaceDetection();
     Q_INVOKABLE void clearFaceTrack(int trackIndex, int clipIndex);
     Q_INVOKABLE bool faceDetectionAvailable();
+
+    // Finds the shot boundaries in a clip's source range. Runs off the GUI thread; the
+    // result lands in `scenes` and in the on-disk cache, never in the project. A cached
+    // analysis for the same clip and settings is published immediately without rescanning.
+    // minSceneSeconds <= 0 means "leave the engine default alone".
+    Q_INVOKABLE void detectScenesForClip(int trackIndex, int clipIndex, bool withObjects,
+                                         double minSceneSeconds = 0.0);
+    Q_INVOKABLE void cancelSceneDetection();
+    // Whether the optional object-labelling pass can run. False until the object-model
+    // addon is installed, which is what the panel's toggle is gated on.
+    Q_INVOKABLE bool objectDetectionAvailable() const;
+    Q_INVOKABLE void clearScenes();
+    // Move the playhead to a detected scene. Scenes are in source time; this maps back
+    // through the clip's trim and speed to reach the right timeline position.
+    Q_INVOKABLE void seekToScene(int sceneIndex);
+    // Sensitivity, persisted in QSettings so a scan does not forget it between sessions.
+    Q_INVOKABLE double sceneThreshold() const;
+    Q_INVOKABLE void setSceneThreshold(double threshold);
     // shapeKind/shapeId is a catalog id from builtinShapes(), which is not always a ShapeKind name:
     // "circle" and "ellipse" are the same kind with different default aspects.
     Q_INVOKABLE void addShapeClip(const QString &shapeKind, double atSeconds);
@@ -545,6 +635,10 @@ public:
     Q_INVOKABLE void duplicateSelectedClip();
     Q_INVOKABLE void moveClip(int trackIndex, int clipIndex, double newStart);
     Q_INVOKABLE void moveClipToTrack(int trackIndex, int clipIndex, int newTrackIndex, double newStart);
+    // Shifts every clip on `trackIndex` starting at/after `gapStartSeconds` left by the
+    // width of the gap immediately following that position, closing it. Linked partner
+    // clips on other tracks (e.g. a companion audio clip) follow along to stay in sync.
+    Q_INVOKABLE void closeGap(int trackIndex, double gapStartSeconds);
     Q_INVOKABLE void alignSelectedClipLeft();
     Q_INVOKABLE void alignSelectedClipRight();
     Q_INVOKABLE void splitSelectedClipLeft();
@@ -670,6 +764,11 @@ public:
                                     double value);
     Q_INVOKABLE void setEffectColorParam(int trackIndex, int clipIndex, int effectIndex,
                                          const QString &key, const QString &value);
+    // File-path params (model3d .glb). Same commit-once path as colour — no preview stream.
+    // Takes a QUrl like replaceAssetSource / importSubtitleFile so the portal and native
+    // dialogs hand us a real local path without QML having to call toLocalFile().
+    Q_INVOKABLE void setEffectStringParam(int trackIndex, int clipIndex, int effectIndex,
+                                          const QString &key, const QUrl &url);
     Q_INVOKABLE QVariantList audioEffectCatalog() const;
     Q_INVOKABLE QVariantList audioEffectCategories() const;
     Q_INVOKABLE void addAudioEffect(int trackIndex, int clipIndex, const QString &effectId);
@@ -796,6 +895,13 @@ public:
     // When reopenLastProject is on: restore recovery silently, else load lastSessionPath.
     // Returns true if a restore/load was started (caller should skip RecoveryDialog).
     Q_INVOKABLE bool restoreLastSessionIfEnabled();
+    // First non-flag positional argument as a local file URL (paths, file://, portal URIs).
+    static QUrl startupProjectUrlFromArguments(const QStringList &args);
+    // argv / QFileOpenEvent. Queued until consumeStartupProject(); after that, emits
+    // externalProjectOpenRequested so QML can confirm unsaved work.
+    void queueExternalProject(const QUrl &url);
+    // Load a queued startup document. True if a load started (skip recovery / last session).
+    Q_INVOKABLE bool consumeStartupProject();
     Q_INVOKABLE QVariantList exportPresets() const; // legacy scale ids/labels
     Q_INVOKABLE QVariantList exportScaleOptions() const;
     // Frame rate choices; the "project" entry is labelled with the current project fps.
@@ -830,6 +936,7 @@ signals:
     // editor so the user can type straight onto the canvas.
     void inlineTextEditRequested(int trackIndex, int clipIndex);
     void inlineTextEditingChanged();
+    void externalProjectOpenRequested(const QUrl &url);
     void tracksChanged();
     void playheadSecondsChanged();
     void playingChanged();
@@ -873,6 +980,10 @@ signals:
     void segmentSessionChanged();
     void openSegmentationWindowRequested(int trackIndex, int clipIndex, double startSeconds,
                                          double durationSeconds);
+    void multicamChanged();
+    void multicamFramesChanged();
+    // Raised by the "multicam" shortcut/action. QML owns the window, as with the file actions.
+    void openMulticamWindowRequested();
     void speedCurveSessionChanged();
     void speedCurveChanged();
     void speedCurveFrameChanged();
@@ -886,6 +997,11 @@ signals:
     void faceDetectProgressChanged();
     void faceDetectStatusChanged();
     void faceDetectionFinished(bool ok, const QString &message);
+    void scenesChanged();
+    void sceneDetectingChanged();
+    void sceneDetectProgressChanged();
+    void sceneDetectStatusChanged();
+    void sceneDetectionFinished(bool ok, const QString &message);
     void selectionChanged();
     void editCapabilitiesChanged();
     void selectedClipDataChanged();
@@ -969,10 +1085,29 @@ protected:
     void rebuildBeatSnapTargets();
     // Beat onsets plus project bookmarks — anything clips should magnet to when snap is on.
     QList<drift::TimeUs> extraSnapTargets() const;
+    // Decodes one frame per angle at the playhead and publishes them to MulticamImageStore.
+    // Coalesces: a refresh requested while one is in flight is dropped, not queued.
+    void refreshMulticamTiles();
+    // Drops in-flight tile decodes. The worker captures `this`, so teardown has to wait
+    // for it before AppController members disappear.
+    void waitForMulticamRefresh();
+    // Playhead rounded to the project's frame grid — a switch must land on a frame boundary,
+    // the same rule stepFrames() follows.
+    drift::TimeUs multicamSwitchTimeUs() const;
+    bool startMulticamPunching(const QList<QPair<int, int>> &videoClips);
+    void rebuildMulticamStaged();
+    void applyMulticamSlicesToProject(drift::Project &project, bool combined);
     void refreshSegmentationPreview();
     void runSegmentationSeed(int generation);
     void finalizeFaceDetection(const QString &clipId, const QString &trackPath,
                                drift::TimeUs srcOffsetUs);
+    // The one place a scan request is built, so the GUI and MCP paths cannot disagree about
+    // the settings — and therefore about the cache key derived from them.
+    drift::SceneDetectRequest sceneRequestFor(const drift::Clip &clip, bool withObjects,
+                                              double minSceneSeconds) const;
+    // Publishes a finished scene analysis into m_scenes, shaped for QML.
+    void applySceneAnalysis(const drift::SceneAnalysis &analysis, const QString &clipId,
+                            const QString &clipPath);
     void finalizeSegmentation(const QString &clipId, const QString &mattePath,
                               drift::TimeUs matteSrcOffsetUs, const QString &outputMode);
     void finalizeGeneratedSubtitles(drift::TimeUs timelineStart, drift::TimeUs timelineDuration,
@@ -1044,11 +1179,13 @@ protected:
     AssetLibrary *m_assetLibrary = nullptr;
     TimelineModel m_timelineModel;
     ClipListModel m_clipListModel;
-    // m_project must outlive m_playback: the playback engine's compositor thread
-    // holds a bare pointer to it and may still be mid-composite at teardown.
-    // Members are destroyed in reverse declaration order, so the project is
-    // declared first and torn down last.
+    // These trees must outlive m_playback: the compositor thread holds a bare
+    // pointer into whichever one is live and may still be mid-composite at
+    // teardown. During a multicam session that is m_multicamStaged, otherwise
+    // m_project. Members are destroyed in reverse declaration order.
     drift::Project m_project;
+    drift::Project m_multicamBase;
+    drift::Project m_multicamStaged;
     PlaybackEngine m_playback;
     // Only for its audioOutputsChanged signal — the sinks resolve devices themselves.
     QMediaDevices m_mediaDevices;
@@ -1094,6 +1231,32 @@ protected:
     int m_speedCurveRevision = 0;
     bool m_speedCurveActive = false;
 
+    struct MulticamAngleSnap {
+        int trackIndex = -1;
+        QString clipId;
+        drift::Clip original;
+        int audioTrackIndex = -1;
+        QString audioClipId;
+        drift::Clip originalAudio;
+        bool hasAudio = false;
+    };
+
+    // Multicam punching session. `m_project` stays the stacked originals until Save.
+    bool m_multicamActive = false;
+    QList<MulticamAngleSnap> m_multicamSnaps;
+    drift::TimeUs m_multicamRangeStart = 0;
+    drift::TimeUs m_multicamRangeEnd = 0;
+    QList<drift::MulticamCut> m_multicamCuts;
+    int m_multicamRevision = 0;
+    // A refresh already running. Tiles are dropped rather than queued while it is set, so a
+    // machine that cannot keep up falls behind in frame rate instead of in wall-clock time.
+    bool m_multicamRefreshing = false;
+    int m_multicamGeneration = 0; // bumped per refresh; stale decodes are dropped
+    QFuture<void> m_multicamRefreshFuture;
+    // Drives tile refreshes during playback only; scrubbing and paused edits refresh directly
+    // off the signal that caused them.
+    QTimer *m_multicamTimer = nullptr;
+
     bool m_fadeCurveActive = false;
     int m_fadeCurveTrack = -1;
     int m_fadeCurveClipIndex = -1;
@@ -1130,6 +1293,16 @@ protected:
     double m_faceDetectProgress = 0.0;
     QString m_faceDetectStatus;
     QAtomicInt m_faceDetectCancel = 0;
+    // Scene detection. Only one clip's analysis is live at a time — the panel shows the
+    // selected clip — so this needs no cache of its own beyond the on-disk one.
+    QVariantList m_scenes;
+    QString m_sceneClipId;
+    QString m_sceneClipPath;
+    bool m_sceneDetecting = false;
+    double m_sceneDetectProgress = 0.0;
+    QString m_sceneDetectStatus;
+    QAtomicInt m_sceneDetectCancel = 0;
+    quint64 m_sceneGeneration = 0;
     bool m_segSessionActive = false;
     bool m_segForTemplate = false;
     bool m_segEncoding = false;
@@ -1213,6 +1386,9 @@ protected:
     QTimer *m_autosaveTimer = nullptr;
     bool m_recoveryAvailable = false;
     QVariantMap m_recoveryInfo;
+    QUrl m_pendingStartupProject;
+    QUrl m_lastExternalProject;
+    bool m_uiReady = false;
     // Launch layout picker / first-clip setup completed for this empty project.
     bool m_projectLayoutChosen = false;
 

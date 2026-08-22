@@ -8,9 +8,11 @@
 #include "models/AssetLibrary.h"
 #include "models/EditorState.h"
 #include "models/FileDialogs.h"
+#include "models/LayoutStore.h"
 #include "models/UpdateChecker.h"
 #include "ClipPreviewImageProvider.h"
 #include "DriftImageProvider.h"
+#include "MulticamImageProvider.h"
 #include "SegmentImageProvider.h"
 #include "TextStylePreviewImageProvider.h"
 #include "preview/PreviewItem.h"
@@ -19,6 +21,8 @@
 // native platform file picker, which routes through xdg-desktop-portal.
 #include <QApplication>
 #include <QCoreApplication>
+#include <QEvent>
+#include <QFileOpenEvent>
 #include <QIcon>
 #include <QLoggingCategory>
 #include <QQmlApplicationEngine>
@@ -26,6 +30,7 @@
 #include <QQuickWindow>
 #include <QSurfaceFormat>
 #include <QtQml/qqml.h>
+#include <QFile>
 
 extern "C" {
 #include <libavutil/log.h>
@@ -59,12 +64,51 @@ void applyLogLevel(bool verbose)
     av_log_set_level(verbose ? AV_LOG_VERBOSE : AV_LOG_ERROR);
 }
 
+class FileOpenFilter : public QObject
+{
+public:
+    explicit FileOpenFilter(AppController *controller, QObject *parent = nullptr)
+        : QObject(parent)
+        , m_controller(controller)
+    {
+    }
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (event->type() == QEvent::FileOpen) {
+            const auto *open = static_cast<QFileOpenEvent *>(event);
+            m_controller->queueExternalProject(open->url());
+            return true;
+        }
+        return QObject::eventFilter(watched, event);
+    }
+
+private:
+    AppController *m_controller = nullptr;
+};
+
 } // namespace
 
 int main(int argc, char *argv[])
 {
     applyLogLevel(verboseLoggingRequested(argc, argv));
 
+#ifdef Q_OS_LINUX
+    // NVIDIA proprietary driver on Wayland lacks EGL_EXT_platform_xcb support,
+    // causing QEGLPlatformContext::Failed to create context: 3009.
+    // Force XCB + GLX to work around this Qt/NVIDIA bug.
+    // If removed, it would break the app for most (if not all) users on Wayland with a Nvidia GPU
+    bool isWayland = qgetenv("XDG_SESSION_TYPE") == "wayland";
+    bool hasNvidiaDriver = QFile::exists("/proc/driver/nvidia/version");
+    bool hasNvidiaDevice = QFile::exists("/dev/nvidiactl");
+    
+    if (isWayland && hasNvidiaDriver && hasNvidiaDevice) {
+        qputenv("QT_QPA_PLATFORM", "xcb");
+        qputenv("QT_XCB_GL_INTEGRATION", "xcb_glx");
+    }
+#endif
+    
     for (int i = 1; i < argc; ++i) {
         if (qstrcmp(argv[i], "--mcp-stdio") == 0) {
             QCoreApplication app(argc, argv);
@@ -127,12 +171,18 @@ int main(int argc, char *argv[])
     static FileDialogs fileDialogs;
     static AddonManager addonManager;
     static UpdateChecker updateChecker;
+    static LayoutStore layoutStore;
     qmlRegisterSingletonInstance("Drift", 1, 0, "AssetLibrary", &assetLibrary);
     qmlRegisterSingletonInstance("Drift", 1, 0, "EditorState", &editorState);
     qmlRegisterSingletonInstance("Drift", 1, 0, "AppController", &editorState);
     qmlRegisterSingletonInstance("Drift", 1, 0, "FileDialogs", &fileDialogs);
     qmlRegisterSingletonInstance("Drift", 1, 0, "Addons", &addonManager);
     qmlRegisterSingletonInstance("Drift", 1, 0, "Updates", &updateChecker);
+    qmlRegisterSingletonInstance("Drift", 1, 0, "LayoutMemory", &layoutStore);
+
+    app.installEventFilter(new FileOpenFilter(&editorState, &app));
+    editorState.queueExternalProject(
+        AppController::startupProjectUrlFromArguments(app.arguments()));
 
     QQmlApplicationEngine engine;
     QObject::connect(&editorState, &AppController::uiLanguageChanged,
@@ -140,6 +190,7 @@ int main(int argc, char *argv[])
     engine.addImageProvider(QStringLiteral("drift"), new DriftImageProvider());
     engine.addImageProvider(QStringLiteral("segment"), new SegmentImageProvider());
     engine.addImageProvider(QStringLiteral("clippreview"), new ClipPreviewImageProvider());
+    engine.addImageProvider(QStringLiteral("multicam"), new MulticamImageProvider());
     engine.addImageProvider(QStringLiteral("textstyle"), new TextStylePreviewImageProvider());
     QObject::connect(
         &engine, &QQmlApplicationEngine::objectCreationFailed, &app, [] { QGuiApplication::exit(-1); }, Qt::QueuedConnection);

@@ -3,6 +3,8 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QMatrix4x4>
 #include <QPainter>
 #include <QProcess>
 #include <QScopeGuard>
@@ -10,9 +12,13 @@
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QThread>
+#include <QVector3D>
+#include <QVector4D>
 #include <atomic>
 
 #include <cmath>
+#include <cstring>
+#include <utility>
 #include <random>
 
 #include "core/Clip.h"
@@ -27,11 +33,18 @@
 #include "engine/audio/ClipAudioRetimer.h"
 #include "engine/AudioFileWriter.h"
 #include "engine/AudioOnsets.h"
+#include "engine/ObjectDetector.h"
+#include "engine/SceneDetect.h"
 #include "engine/DeepFilterDenoiser.h"
 #include "engine/EffectCatalog.h"
 #include "engine/EffectPackageLoader.h"
 #include "engine/EffectProcessor.h"
 #include "engine/FaceTrack.h"
+#include "engine/FaceMesh.h"
+#include "engine/FaceModelTransform.h"
+#include "engine/ModelAsset.h"
+#include "engine/GlModelRenderer.h"
+#include "engine/GlRuntime.h"
 #include "engine/EmojiCatalog.h"
 #include "engine/FontCatalog.h"
 #include "engine/FrameCompositor.h"
@@ -39,7 +52,6 @@
 #include "engine/GpuEffectExecutor.h"
 #include "engine/GpuPackageParse.h"
 
-#include <QJsonDocument>
 #include "engine/MaskApplier.h"
 #include "engine/MatteWriter.h"
 #include "engine/ReverseProxyCache.h"
@@ -69,8 +81,22 @@ private slots:
     void faceTrackV2CarriesContoursAndPose();
     void faceTrackV1FileStillLoads();
     void smoothFaceTrackHandlesMissingBlocks();
+    void faceTrackV2CarriesMesh();
+    void smoothFaceTrackHandlesMissingMesh();
     void applyFaceUniformsEmitsContourArrays();
     void colorParametersParseAndResolve();
+    void modelAssetLoadsCubeGlb();
+    void modelAssetRejectsDraco();
+    void modelAssetRejectsCorrupt();
+    void faceModelMvpIsResolutionIndependent();
+    void faceModelMvpMapsUpToDecreasingNdcY();
+    void faceModelDoesNotLeakGlState();
+    void faceModelFillWireDoesNotLeakGlState();
+    void faceMesh3dEffectPackageLoads();
+    void faceMeshRestLoadsAndWarps();
+    void faceMesh3dPassThroughWithoutMesh();
+    void faceMesh3dDrawsWarpedOverlay();
+    void faceMeshParamsSkipHeadProxy();
     void beautyEffectsPassThroughWithoutContours();
     void emojiCatalogNeedsFontAddon();
     void emojiRasterisesGlyph();
@@ -81,6 +107,10 @@ private slots:
     void clipReaderAppliesDisplayRotation();
     void reverseProxyKeepsDisplayRotation();
     void clipReaderAudioSequential();
+    void audioStreamsAreIndependentPerStreamId();
+    void audioStreamResetRepositionsShortForwardSeek();
+    void audioMixerOverlappingSameFileClips();
+    void videoStreamsDoNotReseekPerFrame();
     void compositorDefaultRenderStaysFullResolution();
     void compositorPreviewScaleRendersLowerResolution();
     void compositorPreviewScaleMapsProjectPixelLayout();
@@ -180,6 +210,17 @@ private slots:
     void audioEffectRackParameterChangeIsContinuous();
     void onsetsDetectClickTrackTempo();
     void onsetsIgnoreSilence();
+
+    void sceneCutsFindIsolatedSpikes();
+    void sceneCutsSuppressNeighbours();
+    void sceneCutsFallBackToAdaptiveThreshold();
+    void sceneCutsKeepWorkingFixedThreshold();
+    void sceneCutsHandleDegenerateInput();
+    void sceneCutsRejectNoiseAndGrain();
+    void scenesPartitionTheRange();
+    void sceneLoudnessRanksAcrossTheClip();
+    void yoloxDecodeAppliesGridAndStride();
+    void objectNmsIsPerClass();
     void denoiseAuxiliaryConstantsRoundTrip();
     void denoisePreservesLengthAndSilence();
     void denoiseRemovesBroadbandNoise();
@@ -190,6 +231,8 @@ private:
     static QString makeColorSegmentsVideo(QTemporaryDir &dir);
     static QString makeRotatedHalvesVideo(QTemporaryDir &dir, int displayDegrees);
     static QString makeToneAudio(QTemporaryDir &dir);
+    static QString makeSweepAudio(QTemporaryDir &dir);
+    static QString makeLongGopVideo(QTemporaryDir &dir);
 };
 
 void EngineTest::initTestCase()
@@ -369,6 +412,20 @@ drift::FaceAnchors makeFullAnchors(double shift)
     return a;
 }
 
+// Mesh is kept out of makeFullAnchors so the minute-size assertion still measures the
+// contours-and-pose sidecar, not the 468-vertex blob.
+drift::FaceAnchors makeFullAnchorsWithMesh(double shift)
+{
+    drift::FaceAnchors a = makeFullAnchors(shift);
+    a.mesh.reserve(drift::kFaceMeshPoints);
+    for (int i = 0; i < drift::kFaceMeshPoints; ++i) {
+        a.mesh.append(QVector3D(float(0.3 + shift + i * 0.001), float(0.4 + i * 0.002),
+                                float(0.01 + i * 0.0001)));
+    }
+    a.hasMesh = true;
+    return a;
+}
+
 } // namespace
 
 void EngineTest::faceTrackV2CarriesContoursAndPose()
@@ -463,13 +520,16 @@ void EngineTest::faceTrackV1FileStillLoads()
     QVERIFY(qAbs(a.faceCenter.x() - 0.25) < 1e-6);
     QVERIFY(!a.hasContours);
     QVERIFY(!a.hasPose);
+    QVERIFY(!a.hasMesh);
     QVERIFY(a.contour.isEmpty());
+    QVERIFY(a.mesh.isEmpty());
 
     // Still interpolates, so the warp effects are unaffected.
     const drift::FaceAnchors mid = loaded.sample(drift::kUsPerSecond / 60, 0);
     QVERIFY(mid.valid);
     QVERIFY(qAbs(mid.faceCenter.x() - 0.30) < 1e-4);
     QVERIFY(!mid.hasContours);
+    QVERIFY(!mid.hasMesh);
 
     // A version from the future is still refused, since we cannot guess what it holds.
     QFile future(dir.filePath(QStringLiteral("future.json")));
@@ -522,6 +582,106 @@ void EngineTest::smoothFaceTrackHandlesMissingBlocks()
 
     // The jitter is gone from the interior frames, which is what smoothing is for.
     QVERIFY(qAbs(track.frames.at(2).faces.at(0).faceCenter.x() - 0.4) < 0.015);
+}
+
+// The 468-vertex mesh is an optional v2 field: round-trip it, interpolate it, and keep older
+// sidecars (v2 without `"m"`, and v1) loading with hasMesh false rather than failing.
+void EngineTest::faceTrackV2CarriesMesh()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("mesh.json"));
+
+    drift::FaceTrack track;
+    track.fps = 30;
+    for (int i = 0; i < 2; ++i) {
+        drift::FaceTrackFrame frame;
+        frame.faces.append(makeFullAnchorsWithMesh(0.1 * i));
+        track.frames.append(frame);
+    }
+
+    QString error;
+    QVERIFY2(drift::writeFaceTrack(path, track, &error), qPrintable(error));
+    drift::FaceTrack loaded;
+    QVERIFY2(drift::readFaceTrack(path, &loaded, &error), qPrintable(error));
+
+    const drift::FaceAnchors &a = loaded.frames.at(0).faces.at(0);
+    QVERIFY(a.hasMesh);
+    QCOMPARE(a.mesh.size(), drift::kFaceMeshPoints);
+    // Same uint16 quantize as contours, so a point is good to about 6e-5.
+    for (int i = 0; i < drift::kFaceMeshPoints; ++i) {
+        QVERIFY(qAbs(a.mesh.at(i).x() - (0.3f + i * 0.001f)) < 1e-4);
+        QVERIFY(qAbs(a.mesh.at(i).y() - (0.4f + i * 0.002f)) < 1e-4);
+        QVERIFY(qAbs(a.mesh.at(i).z() - (0.01f + i * 0.0001f)) < 1e-4);
+    }
+
+    const drift::FaceAnchors mid = loaded.sample(drift::kUsPerSecond / 60, 0);
+    QVERIFY(mid.valid);
+    QVERIFY(mid.hasMesh);
+    QCOMPARE(mid.mesh.size(), drift::kFaceMeshPoints);
+    QVERIFY(qAbs(mid.mesh.at(0).x() - 0.35f) < 1e-3);
+    QVERIFY(qAbs(mid.mesh.at(0).z() - 0.01f) < 1e-3);
+
+    // A v2 sidecar baked before mesh existed is still a valid v2 file: missing "m" is not an
+    // error, it just means the 3D face-mesh effect has nothing to warp.
+    drift::FaceTrack noMesh;
+    noMesh.fps = 30;
+    drift::FaceTrackFrame noMeshFrame;
+    noMeshFrame.faces.append(makeFullAnchors(0.0));
+    noMesh.frames.append(noMeshFrame);
+    const QString noMeshPath = dir.filePath(QStringLiteral("v2-nomesh.json"));
+    QVERIFY2(drift::writeFaceTrack(noMeshPath, noMesh, &error), qPrintable(error));
+    drift::FaceTrack loadedNoMesh;
+    QVERIFY2(drift::readFaceTrack(noMeshPath, &loadedNoMesh, &error), qPrintable(error));
+    QVERIFY(!loadedNoMesh.frames.at(0).faces.at(0).hasMesh);
+    QVERIFY(loadedNoMesh.frames.at(0).faces.at(0).mesh.isEmpty());
+
+    const QByteArray v1 =
+        "{\"version\":1,\"fps\":30,\"startSrcUs\":0,\"frames\":["
+        "[[1,0.2,0.4,0.3,0.4,0.25,0.45,0.25,0.5,0.22,0.5,0.28,0.5,0.25,0.6,0.25,0.3,0.25,0.5,"
+        "0.1,0.12,0.2,0.02,0.9]]]}";
+    const QString v1Path = dir.filePath(QStringLiteral("v1-mesh.json"));
+    QFile v1File(v1Path);
+    QVERIFY(v1File.open(QIODevice::WriteOnly));
+    v1File.write(v1);
+    v1File.close();
+    drift::FaceTrack loadedV1;
+    QVERIFY2(drift::readFaceTrack(v1Path, &loadedV1, &error), qPrintable(error));
+    QVERIFY(!loadedV1.frames.at(0).faces.at(0).hasMesh);
+    QVERIFY(loadedV1.frames.at(0).faces.at(0).mesh.isEmpty());
+}
+
+// Mesh must average only across frames that have it, or a partly re-scanned clip blends a present
+// mesh with an empty neighbour and the warp jumps.
+void EngineTest::smoothFaceTrackHandlesMissingMesh()
+{
+    drift::FaceTrack track;
+    track.fps = 30;
+    for (int i = 0; i < 5; ++i) {
+        drift::FaceTrackFrame frame;
+        drift::FaceAnchors a = makeFullAnchorsWithMesh(0.0);
+        a.faceCenter = QPointF(0.4 + (i % 2 ? 0.02 : -0.02), 0.5);
+        if (i == 2) {
+            a.mesh.clear();
+            a.hasMesh = false;
+        }
+        frame.faces.append(a);
+        track.frames.append(frame);
+    }
+
+    drift::smoothFaceTrack(&track);
+
+    for (int i = 0; i < 5; ++i) {
+        const drift::FaceAnchors &a = track.frames.at(i).faces.at(0);
+        QVERIFY(a.valid);
+        if (i == 2) {
+            QVERIFY(!a.hasMesh);
+            QVERIFY(a.mesh.isEmpty());
+        } else {
+            QVERIFY(a.hasMesh);
+            QCOMPARE(a.mesh.size(), drift::kFaceMeshPoints);
+        }
+    }
 }
 
 // Contour loops travel as array uniforms rather than 256 named scalars; a v1 anchor must emit none
@@ -625,6 +785,540 @@ void EngineTest::colorParametersParseAndResolve()
              QStringLiteral("#123456"));
 }
 
+#ifndef DRIFT_TEST_DATA_DIR
+#define DRIFT_TEST_DATA_DIR "."
+#endif
+
+void EngineTest::modelAssetLoadsCubeGlb()
+{
+    const QString path = QStringLiteral(DRIFT_TEST_DATA_DIR "/cube.glb");
+    QVERIFY2(QFileInfo::exists(path), qPrintable(path));
+
+    QString warning;
+    const auto asset = drift::loadModelAsset(path, &warning);
+    QVERIFY2(asset, qPrintable(warning));
+    QCOMPARE(asset->vertexCount(), 8);
+    QCOMPARE(asset->indices.size(), 36);
+    // Normalised to one head-width: AABB x spans ±0.5.
+    QCOMPARE(asset->aabbMin.x(), -0.5f);
+    QCOMPARE(asset->aabbMax.x(), 0.5f);
+    QVERIFY(asset->aabbMin.y() >= -0.51f && asset->aabbMin.y() <= -0.49f);
+    QVERIFY(asset->aabbMax.y() >= 0.49f && asset->aabbMax.y() <= 0.51f);
+}
+
+void EngineTest::modelAssetRejectsDraco()
+{
+    // Minimal GLB whose JSON requires KHR_draco_mesh_compression. No mesh payload needed —
+    // the loader must refuse before touching accessors.
+    QTemporaryDir tmp;
+    QVERIFY(tmp.isValid());
+    const QString path = tmp.filePath(QStringLiteral("draco.glb"));
+
+    const QByteArray json =
+        R"({"asset":{"version":"2.0"},"extensionsRequired":["KHR_draco_mesh_compression"],)"
+        R"("buffers":[{"byteLength":0}],"scenes":[{"nodes":[]}],"scene":0})";
+    const int jsonPad = (4 - (json.size() % 4)) % 4;
+    QByteArray jsonChunk = json + QByteArray(jsonPad, ' ');
+    const quint32 total = 12 + 8 + quint32(jsonChunk.size());
+    QByteArray glb;
+    glb.append("glTF", 4);
+    auto le32 = [](quint32 v) {
+        char b[4];
+        b[0] = char(v & 0xff);
+        b[1] = char((v >> 8) & 0xff);
+        b[2] = char((v >> 16) & 0xff);
+        b[3] = char((v >> 24) & 0xff);
+        return QByteArray(b, 4);
+    };
+    glb += le32(2);
+    glb += le32(total);
+    glb += le32(quint32(jsonChunk.size()));
+    glb.append("JSON", 4);
+    glb += jsonChunk;
+    QFile f(path);
+    QVERIFY(f.open(QIODevice::WriteOnly));
+    f.write(glb);
+    f.close();
+
+    QString warning;
+    const auto asset = drift::loadModelAsset(path, &warning);
+    QVERIFY(asset == nullptr);
+    QVERIFY2(warning.contains(QStringLiteral("Draco"), Qt::CaseInsensitive), qPrintable(warning));
+}
+
+void EngineTest::modelAssetRejectsCorrupt()
+{
+    QTemporaryDir tmp;
+    QVERIFY(tmp.isValid());
+    const QString path = tmp.filePath(QStringLiteral("corrupt.glb"));
+    QFile f(path);
+    QVERIFY(f.open(QIODevice::WriteOnly));
+    f.write(QByteArray("glTF\x02\x00\x00\x00not-a-real-glb"));
+    f.close();
+
+    QString warning;
+    QVERIFY(drift::loadModelAsset(path, &warning) == nullptr);
+    QVERIFY(!warning.isEmpty());
+}
+
+void EngineTest::faceModelMvpIsResolutionIndependent()
+{
+    drift::FaceAnchors face;
+    face.valid = true;
+    face.hasPose = true;
+    face.faceCenter = QPointF(0.5, 0.5);
+    face.faceRx = 0.2;
+    face.faceRy = 0.24;
+    face.poseQx = 0.0;
+    face.poseQy = 0.0;
+    face.poseQz = 0.0;
+    face.poseQw = 1.0;
+    face.poseOx = 0.5;
+    face.poseOy = 0.5; // already width-normalized for a square frame
+    face.poseOz = 0.0;
+    face.poseScale = 0.2;
+
+    drift::FaceModelParams params;
+    params.scale = 1.0;
+
+    const double aspect = 1.0; // square
+    const QMatrix4x4 a = drift::faceModelMvp(face, params, aspect);
+    const QMatrix4x4 b = drift::faceModelMvp(face, params, aspect);
+    // Bit-identical for a fixed aspect — the WYSIWYG invariant. Pixel size never enters.
+    for (int i = 0; i < 16; ++i)
+        QCOMPARE(a.data()[i], b.data()[i]);
+
+    // Model ±0.5 x-corners at scale=1 with faceRx=0.2 → headBasis scales by 2*0.2=0.4,
+    // so model x=±0.5 maps to wn x = 0.5 ± 0.2 = 0.3 / 0.7, then NDC = 2*wn-1 = -0.4 / 0.4.
+    const QVector4D left = a * QVector4D(-0.5f, 0.f, 0.f, 1.f);
+    const QVector4D right = a * QVector4D(0.5f, 0.f, 0.f, 1.f);
+    QCOMPARE(left.x() / left.w(), float(2.0 * 0.3 - 1.0));
+    QCOMPARE(right.x() / right.w(), float(2.0 * 0.7 - 1.0));
+}
+
+void EngineTest::faceModelMvpMapsUpToDecreasingNdcY()
+{
+    drift::FaceAnchors face;
+    face.valid = true;
+    face.hasPose = true;
+    face.faceRx = 0.2;
+    face.faceRy = 0.24;
+    // Identity quaternion: right=+x, up=+y, fwd=+z in mesh space. Phase-1 pose encodes
+    // image-up as −y in uv, so for hasPose we use a quaternion that maps mesh +Y to −uv.y.
+    // With identity, mesh +Y goes to +wn.y; after wnToNdc that increases NDC y (toward the
+    // bottom of a top-left image). The fallback (no pose) basis uses up=(0,-1,0) explicitly.
+    face.hasPose = false;
+    face.faceCenter = QPointF(0.5, 0.5);
+    face.poseQw = 1.0;
+
+    drift::FaceModelParams params;
+    const double aspect = 1.0;
+    const QMatrix4x4 mvp = drift::faceModelMvp(face, params, aspect);
+    // Model "up" (+Y) must map to decreasing NDC y (toward image top / FBO v=0).
+    const QVector4D origin = mvp * QVector4D(0.f, 0.f, 0.f, 1.f);
+    const QVector4D upPt = mvp * QVector4D(0.f, 0.5f, 0.f, 1.f);
+    QVERIFY2((upPt.y() / upPt.w()) < (origin.y() / origin.w()),
+             "model +Y must map to decreasing NDC y");
+}
+
+void EngineTest::faceModelDoesNotLeakGlState()
+{
+    if (!GpuEffectExecutor::instance().isAvailable())
+        QSKIP("GPU effect executor unavailable");
+
+    const EffectPresetEntry *def = effectDefForId(QStringLiteral("face_mesh_3d"));
+    if (!def)
+        QSKIP("face_mesh_3d package missing from catalog");
+
+    QImage source(64, 64, QImage::Format_RGBA8888);
+    source.fill(QColor(100, 100, 100));
+
+    drift::FaceAnchors face = makeFullAnchorsWithMesh(0);
+    face.poseOx = 0.5;
+    face.poseOy = 0.5;
+    face.faceRx = 0.25;
+    face.faceRy = 0.3;
+
+    drift::Effect model;
+    model.catalogId = QStringLiteral("face_mesh_3d");
+    EffectProcessor::applyEffects(source, {model}, 0, {face});
+
+    // Brightness after a model3d step must still work — catches a leaked GL_DEPTH_TEST /
+    // glDepthMask that would make the fullscreen quad vanish.
+    const EffectPresetEntry *bright = effectDefForId(QStringLiteral("adjust.brightness"));
+    if (!bright)
+        QSKIP("adjust.brightness not in catalog");
+    drift::Effect brightness;
+    brightness.catalogId = bright->meta.id;
+    brightness.parameters.insert(QStringLiteral("brightness"), 0.5);
+    const QImage out = EffectProcessor::applyEffects(source, {brightness}, 0, {});
+    QVERIFY(!out.isNull());
+    QVERIFY(out.pixelColor(32, 32).red() != 100);
+}
+
+void EngineTest::faceModelFillWireDoesNotLeakGlState()
+{
+    if (!GpuEffectExecutor::instance().isAvailable())
+        QSKIP("GPU effect executor unavailable");
+
+    const EffectPresetEntry *def = effectDefForId(QStringLiteral("face_mesh_3d"));
+    if (!def)
+        QSKIP("face_mesh_3d package missing from catalog");
+
+    QImage source(64, 64, QImage::Format_RGBA8888);
+    source.fill(QColor(100, 100, 100));
+
+    drift::FaceAnchors face = makeFullAnchorsWithMesh(0);
+    face.poseOx = 0.5;
+    face.poseOy = 0.5;
+    face.faceRx = 0.25;
+    face.faceRy = 0.3;
+
+    drift::Effect model;
+    model.catalogId = QStringLiteral("face_mesh_3d");
+    model.parameters.insert(QStringLiteral("fillOpacity"), 0.4);
+    model.parameters.insert(QStringLiteral("wireframe"), 1);
+    const QImage overlay = EffectProcessor::applyEffects(source, {model}, 0, {face});
+    QVERIFY(!overlay.isNull());
+
+    const EffectPresetEntry *bright = effectDefForId(QStringLiteral("adjust.brightness"));
+    if (!bright)
+        QSKIP("adjust.brightness not in catalog");
+    drift::Effect brightness;
+    brightness.catalogId = bright->meta.id;
+    brightness.parameters.insert(QStringLiteral("brightness"), 0.5);
+    const QImage out = EffectProcessor::applyEffects(source, {brightness}, 0, {});
+    QVERIFY(!out.isNull());
+    QVERIFY(out.pixelColor(32, 32).red() != 100);
+}
+
+void EngineTest::faceMesh3dEffectPackageLoads()
+{
+    const EffectPresetEntry *def = effectDefForId(QStringLiteral("face_mesh_3d"));
+    QVERIFY2(def, "face_mesh_3d package missing from catalog");
+    QVERIFY(def->isModel3d);
+    QVERIFY(def->needsFace);
+    QVERIFY(def->fixedParams.value(QStringLiteral("warpMesh")).toDouble() > 0.5);
+    bool hasModel = false;
+    bool hasFill = false;
+    bool hasWire = false;
+    for (const drift::EffectParamSpec &spec : def->meta.parameters) {
+        if (spec.key == QLatin1String("model")) {
+            QVERIFY(spec.isFilePath());
+            QVERIFY(spec.defaultString.endsWith(QLatin1String("sfm_face.bin")));
+            QVERIFY(QFileInfo::exists(spec.defaultString));
+            hasModel = true;
+        }
+        if (spec.key == QLatin1String("fillOpacity"))
+            hasFill = true;
+        if (spec.key == QLatin1String("wireframe"))
+            hasWire = true;
+    }
+    QVERIFY(hasModel);
+    QVERIFY(hasFill);
+    QVERIFY(hasWire);
+}
+
+void EngineTest::faceMeshRestLoadsAndWarps()
+{
+    const QString bin = QDir(QString::fromUtf8(DRIFT_TEST_EFFECTS_DIR))
+                            .filePath(QStringLiteral("face_mesh_3d/sfm_face.bin"));
+    QVERIFY2(QFileInfo::exists(bin), qPrintable(bin));
+
+    const auto rest = drift::loadFaceMeshRest(bin);
+    QVERIFY2(rest, qPrintable(drift::faceMeshRestWarning(bin)));
+    QVERIFY(rest->positions.size() > 100);
+    QVERIFY(rest->indices.size() >= 3);
+    QVERIFY(rest->handles.size() >= 30);
+    // Public sfm_reference.obj is 845 verts; a mid-cheek crop was ~600–720.
+    QVERIFY2(rest->positions.size() >= 800,
+             "rest mesh should keep the whole face reference, not a cropped mask");
+    float maxAbsX = 0.f;
+    for (const QVector3D &p : rest->positions)
+        maxAbsX = qMax(maxAbsX, qAbs(p.x()));
+    QVERIFY2(maxAbsX > 0.60f,
+             "rest mesh should include the ear wrap (past the interior ±0.5 face width)");
+    bool hasRightEar = false;
+    bool hasLeftEar = false;
+    for (const drift::FaceMeshHandle &h : rest->handles) {
+        hasRightEar = hasRightEar || h.mediapipeIndex == 234;
+        hasLeftEar = hasLeftEar || h.mediapipeIndex == 454;
+    }
+    QVERIFY2(hasRightEar && hasLeftEar, "ear oval handles 234/454 missing");
+    bool hasForehead = false;
+    for (const drift::FaceMeshHandle &h : rest->handles)
+        hasForehead = hasForehead || h.mediapipeIndex == 10;
+    QVERIFY2(hasForehead, "forehead handle 10 missing");
+
+    drift::FaceAnchors face;
+    face.valid = true;
+    face.hasPose = true;
+    face.poseQw = 1.0;
+    face.faceRx = 0.1;
+    face.poseScale = 0.08;
+    face.poseOx = 0.5;
+    face.poseOy = 0.45;
+    face.poseOz = 0.01;
+    face.hasMesh = true;
+    face.mesh.resize(drift::kFaceMeshPoints);
+    const float s = float(2.0 * face.faceRx);
+    // Identity quaternion: head +X/+Y/+Z map straight into width-normalized world. Place every
+    // MediaPipe slot at the origin, then overwrite handle slots with the rest pose mapped out so
+    // the warp must reconstruct those vertices (and leave non-handles interpolated).
+    for (int i = 0; i < drift::kFaceMeshPoints; ++i)
+        face.mesh[i] = QVector3D(float(face.poseOx), float(face.poseOy), float(face.poseOz));
+    for (const drift::FaceMeshHandle &h : rest->handles) {
+        const QVector3D p = rest->positions.at(h.restVertex);
+        face.mesh[h.mediapipeIndex] =
+            QVector3D(float(face.poseOx) + p.x() * s, float(face.poseOy) + p.y() * s,
+                      float(face.poseOz) + p.z() * s);
+    }
+
+    QVector<QVector3D> pos;
+    QVector<QVector3D> nrm;
+    drift::warpFaceMesh(*rest, face, &pos, &nrm);
+    QCOMPARE(pos.size(), rest->positions.size());
+    QCOMPARE(nrm.size(), rest->positions.size());
+    for (const drift::FaceMeshHandle &h : rest->handles) {
+        const QVector3D got = pos.at(h.restVertex);
+        const QVector3D want = rest->positions.at(h.restVertex);
+        QVERIFY2((got - want).length() < 1e-4f,
+                 qPrintable(QStringLiteral("handle %1 restVertex %2 delta %3")
+                                .arg(h.mediapipeIndex)
+                                .arg(h.restVertex)
+                                .arg(double((got - want).length()))));
+    }
+
+    // SFM rest is taller than a typical tracked face. IDW-only would pin eyes/mouth and leave
+    // the hairline at rest size. Shrink every handle target by 0.7; a far vertex (max |y|)
+    // must follow that scale instead of staying put.
+    QSet<int> handleVerts;
+    for (const drift::FaceMeshHandle &h : rest->handles)
+        handleVerts.insert(h.restVertex);
+    int farIdx = 0;
+    float farAbsY = 0.f;
+    for (int i = 0; i < rest->positions.size(); ++i) {
+        if (handleVerts.contains(i))
+            continue;
+        const float ay = qAbs(rest->positions.at(i).y());
+        if (ay > farAbsY) {
+            farAbsY = ay;
+            farIdx = i;
+        }
+    }
+    QVERIFY2(farAbsY > 0.3f, "need a non-handle vertex away from the mid-face");
+    const float shrink = 0.7f;
+    for (const drift::FaceMeshHandle &h : rest->handles) {
+        const QVector3D p = rest->positions.at(h.restVertex);
+        face.mesh[h.mediapipeIndex] =
+            QVector3D(float(face.poseOx) + p.x() * s * shrink,
+                      float(face.poseOy) + p.y() * s * shrink,
+                      float(face.poseOz) + p.z() * s * shrink);
+    }
+    QVector<QVector3D> shrunk;
+    QVector<QVector3D> shrunkN;
+    drift::warpFaceMesh(*rest, face, &shrunk, &shrunkN);
+    const float restY = rest->positions.at(farIdx).y();
+    const float gotY = shrunk.at(farIdx).y();
+    QVERIFY2(qAbs(gotY - restY * shrink) < 0.08f * qAbs(restY),
+             qPrintable(QStringLiteral("far vertex y rest %1 warped %2 (expected ~%3)")
+                            .arg(restY)
+                            .arg(gotY)
+                            .arg(restY * shrink)));
+
+    // Restore 1:1 handle placement, then push every handle 0.02 along +Z in world.
+    // Head-space Z is the same axis at identity, so the warped handle vertices must
+    // move by 0.02 / s.
+    for (const drift::FaceMeshHandle &h : rest->handles) {
+        const QVector3D p = rest->positions.at(h.restVertex);
+        face.mesh[h.mediapipeIndex] =
+            QVector3D(float(face.poseOx) + p.x() * s, float(face.poseOy) + p.y() * s,
+                      float(face.poseOz) + p.z() * s);
+    }
+    const float dz = 0.02f;
+    for (const drift::FaceMeshHandle &h : rest->handles)
+        face.mesh[h.mediapipeIndex].setZ(face.mesh[h.mediapipeIndex].z() + dz);
+    QVector<QVector3D> moved;
+    QVector<QVector3D> movedN;
+    drift::warpFaceMesh(*rest, face, &moved, &movedN);
+    const float expectZ = dz / s;
+    const QVector3D sample = moved.at(rest->handles.first().restVertex)
+                             - rest->positions.at(rest->handles.first().restVertex);
+    QVERIFY2(qAbs(sample.z() - expectZ) < 1e-3f,
+             qPrintable(QStringLiteral("expected z delta %1 got %2").arg(expectZ).arg(sample.z())));
+
+    // SFM rest is closed-mouth: inner upper (MP 13) and lower (MP 14) sit on top of each other.
+    // Opening them must not IDW-average a 1-ring neighbour into the gap (a zipped cupid's bow).
+    int upperVert = -1;
+    int lowerVert = -1;
+    for (const drift::FaceMeshHandle &h : rest->handles) {
+        if (h.mediapipeIndex == 13)
+            upperVert = h.restVertex;
+        if (h.mediapipeIndex == 14)
+            lowerVert = h.restVertex;
+    }
+    QVERIFY2(upperVert >= 0 && lowerVert >= 0, "inner-lip handles 13/14 missing");
+    QVERIFY2((rest->positions.at(upperVert) - rest->positions.at(lowerVert)).length() < 0.02f,
+             "rest inner lips should be nearly coincident");
+    for (const drift::FaceMeshHandle &h : rest->handles) {
+        const QVector3D p = rest->positions.at(h.restVertex);
+        face.mesh[h.mediapipeIndex] =
+            QVector3D(float(face.poseOx) + p.x() * s, float(face.poseOy) + p.y() * s,
+                      float(face.poseOz) + p.z() * s);
+    }
+    const float open = 0.05f;
+    face.mesh[13].setY(face.mesh[13].y() + open * s);
+    face.mesh[14].setY(face.mesh[14].y() - open * s);
+    QVector<QVector3D> opened;
+    QVector<QVector3D> openedN;
+    drift::warpFaceMesh(*rest, face, &opened, &openedN);
+    int nbr = -1;
+    for (int t = 0; t + 2 < rest->indices.size(); t += 3) {
+        const int a = int(rest->indices.at(t));
+        const int b = int(rest->indices.at(t + 1));
+        const int c = int(rest->indices.at(t + 2));
+        const int tri[3] = {a, b, c};
+        bool hit = false;
+        for (int v : tri)
+            hit = hit || v == upperVert;
+        if (!hit)
+            continue;
+        for (int v : tri) {
+            if (v != upperVert && v != lowerVert) {
+                nbr = v;
+                break;
+            }
+        }
+        if (nbr >= 0)
+            break;
+    }
+    QVERIFY2(nbr >= 0, "no 1-ring neighbour of inner upper lip");
+    const float midY = 0.5f * (opened.at(upperVert).y() + opened.at(lowerVert).y());
+    QVERIFY2(qAbs(opened.at(nbr).y() - opened.at(upperVert).y())
+                 < qAbs(opened.at(nbr).y() - midY),
+             qPrintable(QStringLiteral("upper-lip neighbour y %1 mid %2 upper %3 lower %4")
+                            .arg(opened.at(nbr).y())
+                            .arg(midY)
+                            .arg(opened.at(upperVert).y())
+                            .arg(opened.at(lowerVert).y())));
+}
+
+void EngineTest::faceMesh3dPassThroughWithoutMesh()
+{
+    if (!GpuEffectExecutor::instance().isAvailable())
+        QSKIP("GPU effect executor unavailable");
+
+    const EffectPresetEntry *def = effectDefForId(QStringLiteral("face_mesh_3d"));
+    if (!def)
+        QSKIP("face_mesh_3d package missing from catalog");
+
+    QImage source(64, 64, QImage::Format_RGBA8888);
+    source.fill(QColor(80, 90, 100));
+
+    drift::FaceAnchors face;
+    face.valid = true;
+    face.hasPose = true;
+    face.faceCenter = QPointF(0.5, 0.5);
+    face.faceRx = 0.2;
+    face.poseQw = 1.0;
+    face.poseOx = 0.5;
+    face.poseOy = 0.5;
+    QVERIFY(!face.hasMesh);
+
+    drift::Effect effect;
+    effect.catalogId = QStringLiteral("face_mesh_3d");
+    const QImage out = EffectProcessor::applyEffects(source, {effect}, 0, {face});
+    QVERIFY(!out.isNull());
+    QCOMPARE(out.size(), source.size());
+    QCOMPARE(out.pixelColor(32, 32), source.pixelColor(32, 32));
+}
+
+void EngineTest::faceMesh3dDrawsWarpedOverlay()
+{
+    if (!GpuEffectExecutor::instance().isAvailable())
+        QSKIP("GPU effect executor unavailable");
+
+    const EffectPresetEntry *def = effectDefForId(QStringLiteral("face_mesh_3d"));
+    if (!def)
+        QSKIP("face_mesh_3d package missing from catalog");
+
+    const QString bin = QDir(QString::fromUtf8(DRIFT_TEST_EFFECTS_DIR))
+                            .filePath(QStringLiteral("face_mesh_3d/sfm_face.bin"));
+    const auto rest = drift::loadFaceMeshRest(bin);
+    QVERIFY(rest);
+
+    QImage source(128, 128, QImage::Format_RGBA8888);
+    source.fill(QColor(40, 40, 40));
+
+    // Identity quaternion is what the other pose tests use; it is *not* a real landmarker
+    // frontal. MediaPipe's forward = right × (forehead−chin) has z < 0 — a half-turn about X
+    // — which reverses screen winding. Back-face cull made the overlay vanish looking into
+    // the camera while a 3/4 view still showed side faces.
+    const struct {
+        double qx;
+        double qw;
+        const char *name;
+    } poses[] = {
+        {0.0, 1.0, "identity quaternion"},
+        {1.0, 0.0, "MediaPipe-like frontal (forward.z < 0)"},
+    };
+
+    for (const auto &pose : poses) {
+        drift::FaceAnchors face;
+        face.valid = true;
+        face.hasPose = true;
+        face.poseQx = pose.qx;
+        face.poseQw = pose.qw;
+        face.faceRx = 0.25;
+        face.faceRy = 0.3;
+        face.faceCenter = QPointF(0.5, 0.5);
+        face.poseOx = 0.5;
+        face.poseOy = 0.5;
+        face.poseOz = 0.0;
+        face.hasMesh = true;
+        face.mesh.resize(drift::kFaceMeshPoints);
+        const float s = float(2.0 * face.faceRx);
+        const QVector3D origin(float(face.poseOx), float(face.poseOy), float(face.poseOz));
+        const QVector3D qxyz(float(face.poseQx), float(face.poseQy), float(face.poseQz));
+        const float qw = float(face.poseQw);
+        auto rotate = [&](QVector3D p) {
+            const QVector3D t = 2.f * QVector3D::crossProduct(qxyz, p);
+            return p + qw * t + QVector3D::crossProduct(qxyz, t);
+        };
+        for (int i = 0; i < drift::kFaceMeshPoints; ++i)
+            face.mesh[i] = origin;
+        for (const drift::FaceMeshHandle &h : rest->handles) {
+            const QVector3D p = rest->positions.at(h.restVertex);
+            face.mesh[h.mediapipeIndex] = origin + rotate(p) * s;
+        }
+
+        drift::Effect effect;
+        effect.catalogId = QStringLiteral("face_mesh_3d");
+        // Head-occlusion true used to write the prop ellipsoid in front of the fitted surface
+        // and swallow the overlay. The mesh is the occluder now.
+        effect.parameters.insert(QStringLiteral("occlusion"), true);
+        const QImage out = EffectProcessor::applyEffects(source, {effect}, 0, {face});
+        QVERIFY2(!out.isNull(), pose.name);
+        QCOMPARE(out.size(), source.size());
+        QVERIFY2(out.pixelColor(64, 64) != source.pixelColor(64, 64),
+                 qPrintable(QStringLiteral("%1: centre stayed %2 (warped mesh should overlay)")
+                                .arg(QLatin1String(pose.name), out.pixelColor(64, 64).name())));
+    }
+}
+
+void EngineTest::faceMeshParamsSkipHeadProxy()
+{
+    QMap<QString, QVariant> map;
+    map.insert(QStringLiteral("warpMesh"), 1.0);
+    const drift::FaceModelParams p = drift::faceModelParamsFromMap(map);
+    QVERIFY(p.warpMesh);
+    QVERIFY(!p.occlusion);
+
+    map.insert(QStringLiteral("occlusion"), true);
+    const drift::FaceModelParams on = drift::faceModelParamsFromMap(map);
+    QVERIFY(on.occlusion); // still parsed, but the renderer ignores the ellipsoid when warping
+}
+
 // Every beauty package must pass the frame through untouched when the clip has no contours, or an
 // un-rescanned clip looks broken rather than merely un-scanned.
 void EngineTest::beautyEffectsPassThroughWithoutContours()
@@ -703,7 +1397,7 @@ void EngineTest::matteWriterRoundTripsThroughClipReader()
         // Sample the middle of each frame's interval: the boundary time can land a hair below it
         // and resolve to the previous frame.
         const drift::TimeUs us = (2 * drift::TimeUs(i) + 1) * drift::kUsPerSecond / 60;
-        const QImage frame = ClipReaderPool::instance().readVideoFrame(path, us, 0, 0);
+        const QImage frame = ClipReaderPool::instance().readVideoFrame(path, 1, us, 0, 0);
         QVERIFY2(!frame.isNull(), qPrintable(QStringLiteral("frame %1 did not decode").arg(i)));
         QCOMPARE(frame.size(), size);
 
@@ -759,7 +1453,7 @@ void EngineTest::reverseRendererPlaysSourceBackwards()
     // coverOut - i frames into the proxy. Walking the proxy forwards must walk the source back.
     for (int j = 1; j <= frames; ++j) {
         const drift::TimeUs us = drift::TimeUs(j) * drift::kUsPerSecond / fps;
-        const QImage frame = ClipReaderPool::instance().readVideoFrame(proxyPath, us, 0, 0);
+        const QImage frame = ClipReaderPool::instance().readVideoFrame(proxyPath, 1, us, 0, 0);
         QVERIFY2(!frame.isNull(), qPrintable(QStringLiteral("proxy frame %1 did not decode").arg(j)));
 
         int band = -1;
@@ -1116,6 +1810,312 @@ QString EngineTest::makeToneAudio(QTemporaryDir &dir)
     if (!proc.waitForFinished(30000) || proc.exitCode() != 0)
         return {};
     return QFileInfo::exists(out) ? out : QString{};
+}
+
+// Builds a 4-second, 640x360 clip with 2-second keyframe spacing — long enough that landing on
+// the wrong side of a keyframe costs a real GOP of decoding, which a 25-frame GOP hides.
+QString EngineTest::makeLongGopVideo(QTemporaryDir &dir)
+{
+    const QString ffmpeg = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
+    if (ffmpeg.isEmpty())
+        return {};
+
+    const QString out = dir.filePath(QStringLiteral("longgop.mp4"));
+    QStringList args{
+        QStringLiteral("-y"),
+        QStringLiteral("-f"), QStringLiteral("lavfi"), QStringLiteral("-i"),
+        QStringLiteral("testsrc2=s=640x360:r=25:d=4"),
+        QStringLiteral("-c:v"), QStringLiteral("libx264"),
+        QStringLiteral("-g"), QStringLiteral("50"),
+        QStringLiteral("-pix_fmt"), QStringLiteral("yuv420p"),
+        out,
+    };
+
+    QProcess proc;
+    proc.start(ffmpeg, args);
+    if (!proc.waitForFinished(60000) || proc.exitCode() != 0)
+        return {};
+    return QFileInfo::exists(out) ? out : QString{};
+}
+
+// Two clips cut from one file and overlapping on the timeline interleave reads at positions
+// seconds apart, once per composited frame. Sharing a decoder between them stayed visually correct
+// — the decode loop always walks forward to the frame it was asked for — but it walked most of a
+// GOP to get there, over and over: measured on this source, 8251 frames decoded and 5.3 s of wall
+// time for what takes 391 frames and 0.22 s when each clip has its own reader. That is what made
+// overlaps crawl. The comparison here is against the same interleaving across two separate files,
+// which never shared a reader and so was always fast.
+void EngineTest::videoStreamsDoNotReseekPerFrame()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = makeLongGopVideo(dir);
+    if (path.isEmpty())
+        QSKIP("ffmpeg not available to generate a test clip");
+    const QString copy = dir.filePath(QStringLiteral("longgop-copy.mp4"));
+    QVERIFY(QFile::copy(path, copy));
+
+    constexpr int kFrames = 50;
+    constexpr drift::TimeUs kStep = 40'000;         // 25 fps
+    constexpr drift::TimeUs kSecondStart = 2'000'000; // the other clip's source range
+
+    // The preview path: NV12, which is what playback actually drives.
+    ClipReaderPool::instance().setReadAheadUs(0);
+
+    // How much decoding the same interleaving costs when the two clips are separate files and so
+    // cannot share a reader — the baseline this must match.
+    const quint64 twoFileBefore = ClipReader::videoFramesDecoded();
+    for (int i = 0; i < kFrames; ++i) {
+        QVERIFY(ClipReaderPool::instance()
+                    .readVideoFrameNv12(path, 101, drift::TimeUs(i) * kStep, 640, 360)
+                    .isValid());
+        QVERIFY(ClipReaderPool::instance()
+                    .readVideoFrameNv12(copy, 202, kSecondStart + drift::TimeUs(i) * kStep, 640, 360)
+                    .isValid());
+    }
+    const quint64 twoFileDecoded = ClipReader::videoFramesDecoded() - twoFileBefore;
+
+    // The same interleaving, both streams on one file.
+    const quint64 oneFileBefore = ClipReader::videoFramesDecoded();
+    for (int i = 0; i < kFrames; ++i) {
+        QVERIFY(ClipReaderPool::instance()
+                    .readVideoFrameNv12(path, 303, drift::TimeUs(i) * kStep, 640, 360)
+                    .isValid());
+        QVERIFY(ClipReaderPool::instance()
+                    .readVideoFrameNv12(path, 404, kSecondStart + drift::TimeUs(i) * kStep, 640, 360)
+                    .isValid());
+    }
+    const quint64 oneFileDecoded = ClipReader::videoFramesDecoded() - oneFileBefore;
+
+    // Each stream walks its own range forward, so one file now costs what two separate files cost.
+    // The margin is wide because the failure it guards against is a factor of twenty, not a few
+    // percent.
+    QVERIFY2(oneFileDecoded < twoFileDecoded * 2,
+             qPrintable(QStringLiteral("one file decoded %1 frames, two files decoded %2")
+                            .arg(oneFileDecoded).arg(twoFileDecoded)));
+}
+
+// A 440 Hz sine sounds the same wherever you start it, so it cannot show that audio came from the
+// wrong source position. This is a linear chirp — 200 Hz rising by 600 Hz per second — where every
+// moment has its own frequency and an offset read is measurably different from the right one.
+QString EngineTest::makeSweepAudio(QTemporaryDir &dir)
+{
+    const QString ffmpeg = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
+    if (ffmpeg.isEmpty())
+        return {};
+
+    const QString out = dir.filePath(QStringLiteral("sweep.wav"));
+    QStringList args{
+        QStringLiteral("-y"),
+        QStringLiteral("-f"), QStringLiteral("lavfi"), QStringLiteral("-i"),
+        // 0.3 amplitude so two of these summed stay under the mixer's soft-clip knee and the
+        // expected mix is a plain addition.
+        QStringLiteral("aevalsrc=0.3*sin(2*PI*(200+300*t)*t):d=6:s=48000"),
+        QStringLiteral("-c:a"), QStringLiteral("pcm_s16le"),
+        out,
+    };
+
+    QProcess proc;
+    proc.start(ffmpeg, args);
+    if (!proc.waitForFinished(30000) || proc.exitCode() != 0)
+        return {};
+    return QFileInfo::exists(out) ? out : QString{};
+}
+
+namespace {
+
+double interleavedRmsError(const QVector<float> &a, const QVector<float> &b, int fromFrame, int toFrame)
+{
+    double err = 0.0;
+    int n = 0;
+    for (int i = fromFrame * 2; i < toFrame * 2; ++i, ++n) {
+        const double d = static_cast<double>(a[i]) - b[i];
+        err += d * d;
+    }
+    return n > 0 ? std::sqrt(err / n) : 0.0;
+}
+
+} // namespace
+
+// Two consumers of one media file must not share a decode cursor. ClipReader decodes audio
+// sequentially and serves a request near its cursor as a continuation, so before stream ids the
+// second caller was handed the first caller's audio and stayed offset by the gap between them.
+void EngineTest::audioStreamsAreIndependentPerStreamId()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = makeSweepAudio(dir);
+    if (path.isEmpty())
+        QSKIP("ffmpeg not available to generate a test clip");
+
+    constexpr int kRate = 48000;
+    constexpr int kChunk = 1024;
+    constexpr int kChunks = 40;
+    constexpr int kTotal = kChunk * kChunks;
+    constexpr drift::TimeUs kStartA = 0;
+    // 1.5 s ahead of A: inside the reader's 2 s forward tolerance, which is exactly the window
+    // where it used to continue the other stream instead of seeking.
+    constexpr drift::TimeUs kStartB = 1'500'000;
+
+    QVector<float> refA(kTotal * 2, 0.0f);
+    QVector<float> refB(kTotal * 2, 0.0f);
+    {
+        ClipReader a;
+        QVERIFY(a.open(path));
+        QCOMPARE(a.readAudioInterleaved(kStartA, kTotal, kRate, refA.data()), kTotal);
+        ClipReader b;
+        QVERIFY(b.open(path));
+        QCOMPARE(b.readAudioInterleaved(kStartB, kTotal, kRate, refB.data()), kTotal);
+    }
+    // The chirp really does differ across that offset, so the comparison below can fail.
+    QVERIFY(interleavedRmsError(refA, refB, 0, kTotal) > 0.05);
+
+    // Interleave the two streams block by block, the way AudioMixer reads two overlapping clips.
+    QVector<float> gotA(kTotal * 2, 0.0f);
+    QVector<float> gotB(kTotal * 2, 0.0f);
+    QVector<float> chunk(kChunk * 2);
+    for (int c = 0; c < kChunks; ++c) {
+        const drift::TimeUs offsetUs =
+            static_cast<drift::TimeUs>(c) * kChunk * drift::kUsPerSecond / kRate;
+        for (auto &stream : {std::pair{quint64{7}, &gotA}, std::pair{quint64{9}, &gotB}}) {
+            const drift::TimeUs base = stream.first == 7 ? kStartA : kStartB;
+            const int n = ClipReaderPool::instance().readAudioInterleaved(
+                path, stream.first, base + offsetUs, kChunk, kRate, chunk.data());
+            QCOMPARE(n, kChunk);
+            std::memcpy(stream.second->data() + static_cast<size_t>(c) * kChunk * 2, chunk.constData(),
+                        static_cast<size_t>(kChunk) * 2 * sizeof(float));
+        }
+    }
+
+    QVERIFY2(interleavedRmsError(refA, gotA, 0, kTotal) < 0.02, "stream 7 does not match its source");
+    QVERIFY2(interleavedRmsError(refB, gotB, 0, kTotal) < 0.02, "stream 9 does not match its source");
+}
+
+// A forward seek shorter than the reader's 2 s threshold looks like ordinary playback to the
+// sequential fast path, so it used to keep streaming from the pre-seek position forever.
+void EngineTest::audioStreamResetRepositionsShortForwardSeek()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = makeSweepAudio(dir);
+    if (path.isEmpty())
+        QSKIP("ffmpeg not available to generate a test clip");
+
+    constexpr int kRate = 48000;
+    constexpr int kChunk = 1024;
+    constexpr quint64 kStream = 42;
+    constexpr drift::TimeUs kSeekToUs = 1'000'000; // 1 s forward: well inside the tolerance
+
+    QVector<float> chunk(kChunk * 2);
+    drift::TimeUs pos = 0;
+    for (int c = 0; c < 10; ++c) {
+        QCOMPARE(ClipReaderPool::instance().readAudioInterleaved(path, kStream, pos, kChunk, kRate,
+                                                                 chunk.data()),
+                 kChunk);
+        pos += static_cast<drift::TimeUs>(kChunk) * drift::kUsPerSecond / kRate;
+    }
+
+    ClipReaderPool::instance().resetAudioStreams();
+
+    QVector<float> got(kChunk * 2, 0.0f);
+    QCOMPARE(ClipReaderPool::instance().readAudioInterleaved(path, kStream, kSeekToUs, kChunk, kRate,
+                                                             got.data()),
+             kChunk);
+
+    QVector<float> expected(kChunk * 2, 0.0f);
+    ClipReader ref;
+    QVERIFY(ref.open(path));
+    QCOMPARE(ref.readAudioInterleaved(kSeekToUs, kChunk, kRate, expected.data()), kChunk);
+
+    QVERIFY2(interleavedRmsError(expected, got, 0, kChunk) < 0.02,
+             "audio did not reposition after the stream reset");
+}
+
+// The bug this whole change exists for: two clips cut from one file, overlapping on a track, read
+// back to back inside a single mix block. The second clip used to be served the first clip's stream
+// and stayed offset by the gap between their source positions for the rest of its length.
+void EngineTest::audioMixerOverlappingSameFileClips()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = makeSweepAudio(dir);
+    if (path.isEmpty())
+        QSKIP("ffmpeg not available to generate a test clip");
+
+    constexpr int kRate = 48000;
+    constexpr drift::TimeUs kClipDurUs = 2'000'000;
+    constexpr drift::TimeUs kBStartUs = 1'500'000; // 0.5 s overlap
+    constexpr drift::TimeUs kBSrcInUs = 3'000'000; // 1.5 s ahead of A at the overlap: in tolerance
+    constexpr drift::TimeUs kSpanUs = kBStartUs + kClipDurUs;
+
+    drift::Project project;
+    drift::Track track{.type = drift::TrackType::Audio};
+
+    drift::Clip a;
+    a.id = QStringLiteral("clip-a");
+    a.type = drift::ClipType::Audio;
+    a.path = path;
+    a.timelineStart = 0;
+    a.timelineDuration = kClipDurUs;
+    a.srcIn = 0;
+    a.srcOut = kClipDurUs;
+    track.clips.append(a);
+
+    drift::Clip b = a;
+    b.id = QStringLiteral("clip-b");
+    b.timelineStart = kBStartUs;
+    b.srcIn = kBSrcInUs;
+    b.srcOut = kBSrcInUs + kClipDurUs;
+    track.clips.append(b);
+
+    project.tracks().append(track);
+
+    AudioMixer mixer;
+    mixer.setProject(&project);
+
+    const int total = static_cast<int>((kSpanUs * kRate) / drift::kUsPerSecond);
+    const int clipFrames = static_cast<int>((kClipDurUs * kRate) / drift::kUsPerSecond);
+    const int bOffset = static_cast<int>((kBStartUs * kRate) / drift::kUsPerSecond);
+
+    QVector<float> mixed(total * 2, 0.0f);
+    constexpr int kBlock = 1024;
+    for (int offset = 0; offset < total; offset += kBlock) {
+        const int count = std::min(kBlock, total - offset);
+        const auto startUs =
+            static_cast<drift::TimeUs>((static_cast<int64_t>(offset) * drift::kUsPerSecond) / kRate);
+        mixer.mix(startUs, count, kRate, mixed.data() + static_cast<size_t>(offset) * 2);
+    }
+
+    // What each clip should contribute, read straight from the file on its own reader.
+    QVector<float> srcA(clipFrames * 2, 0.0f);
+    QVector<float> srcB(clipFrames * 2, 0.0f);
+    {
+        ClipReader ra;
+        QVERIFY(ra.open(path));
+        QCOMPARE(ra.readAudioInterleaved(0, clipFrames, kRate, srcA.data()), clipFrames);
+        ClipReader rb;
+        QVERIFY(rb.open(path));
+        QCOMPARE(rb.readAudioInterleaved(kBSrcInUs, clipFrames, kRate, srcB.data()), clipFrames);
+    }
+
+    // 0.3 amplitude each, so the sum never reaches the soft-clip knee and this is plain addition.
+    QVector<float> expected(total * 2, 0.0f);
+    for (int i = 0; i < clipFrames * 2; ++i) {
+        expected[i] += srcA[i];
+        expected[bOffset * 2 + i] += srcB[i];
+    }
+
+    double sumSq = 0.0;
+    for (float v : expected)
+        sumSq += static_cast<double>(v) * v;
+    QVERIFY(std::sqrt(sumSq / expected.size()) > 0.05); // audibly non-silent
+
+    // Through the overlap...
+    QVERIFY2(interleavedRmsError(expected, mixed, bOffset, clipFrames) < 0.02,
+             "overlap region does not sum the two clips");
+    // ...and the tail, where only clip B plays and the old code left it permanently offset.
+    QVERIFY2(interleavedRmsError(expected, mixed, clipFrames, total) < 0.02,
+             "clip B is out of sync after the overlap ends");
 }
 
 // Sequential small buffers must reconstruct the same signal as one contiguous
@@ -2884,7 +3884,25 @@ void EngineTest::transitionRenderingIsDeterministic()
         compositor.compositeAt(drift::secondsToUs(2.4));
         const QImage rescrubbed = compositor.compositeAt(drift::secondsToUs(1.75));
 
-        QVERIFY2(first == rescrubbed, qPrintable(kindId));
+        if (first != rescrubbed) {
+            int maxd = 255;
+            const QImage a = first.convertToFormat(QImage::Format_RGBA8888);
+            const QImage b = rescrubbed.convertToFormat(QImage::Format_RGBA8888);
+            if (a.size() == b.size()) {
+                maxd = 0;
+                for (int y = 0; y < a.height(); ++y) {
+                    const uchar *pa = a.constScanLine(y);
+                    const uchar *pb = b.constScanLine(y);
+                    const int n = a.width() * 4;
+                    for (int i = 0; i < n; ++i) {
+                        const int d = qAbs(int(pa[i]) - int(pb[i]));
+                        if (d > maxd)
+                            maxd = d;
+                    }
+                }
+            }
+            QFAIL(qPrintable(QStringLiteral("%1: max channel delta %2").arg(kindId).arg(maxd)));
+        }
     }
 }
 
@@ -5125,7 +6143,7 @@ void EngineTest::audioFileWriterRoundTripsThroughClipReader()
     QVERIFY(!QFileInfo::exists(path + QStringLiteral(".part")));
 
     std::vector<float> read(size_t(kFrames) * 2, 0.0f);
-    const int got = ClipReaderPool::instance().readAudioInterleaved(path, 0, kFrames, kRate,
+    const int got = ClipReaderPool::instance().readAudioInterleaved(path, 1, 0, kFrames, kRate,
                                                                     read.data());
     QVERIFY2(got > kFrames / 2, qPrintable(QStringLiteral("decoded only %1 frames").arg(got)));
 
@@ -5197,6 +6215,357 @@ void EngineTest::onsetsIgnoreSilence()
         blip[size_t(i + 1000)] = 0.8f;
     const AudioBeatAnalysis b = AudioOnsets::analyze(blip.data(), int(blip.size()), kRate, 0.0);
     QCOMPARE(b.bpm, 0.0);
+}
+
+// --- scene detection --------------------------------------------------------
+// The cut policy is a pure function of the difference signal, so these drive it with
+// synthetic signals rather than decoding anything.
+
+namespace {
+
+// A flat signal at `floorValue` with spikes of `spikeValue` at the given indices.
+QList<double> diffSignal(int length, double floorValue, const QList<int> &spikes,
+                         double spikeValue)
+{
+    QList<double> diffs(length, floorValue);
+    for (int i : spikes) {
+        if (i >= 0 && i < length)
+            diffs[i] = spikeValue;
+    }
+    return diffs;
+}
+
+} // namespace
+
+void EngineTest::sceneCutsFindIsolatedSpikes()
+{
+    const QList<int> expected{100, 400, 900};
+    const QList<double> diffs = diffSignal(1200, 3.0, expected, 90.0);
+
+    double used = 0.0;
+    bool adaptive = true;
+    const QList<int> cuts = drift::resolveCuts(diffs, 27.0, 15, true, 4.0, &used, &adaptive);
+
+    QCOMPARE(cuts, expected);
+    // Well clear of the fixed threshold, so the fallback must not have been consulted.
+    QCOMPARE(adaptive, false);
+    QCOMPARE(used, 27.0);
+}
+
+void EngineTest::sceneCutsSuppressNeighbours()
+{
+    // A dissolve smears one transition over several frames. Only the strongest may survive.
+    QList<double> diffs(600, 2.0);
+    diffs[300] = 40.0;
+    diffs[303] = 95.0; // the true centre
+    diffs[306] = 55.0;
+
+    const QList<int> cuts = drift::resolveCuts(diffs, 27.0, 15, false);
+    QCOMPARE(cuts, QList<int>{303});
+
+    // With a gap shorter than the spread, all three are legitimately distinct cuts.
+    const QList<int> narrow = drift::resolveCuts(diffs, 27.0, 2, false);
+    QCOMPARE(narrow, (QList<int>{300, 303, 306}));
+}
+
+void EngineTest::sceneCutsFallBackToAdaptiveThreshold()
+{
+    // Graded footage: the whole signal sits far below 27, which is the case the reference
+    // Python implementation gets wrong. The spikes are still obvious relative to the noise.
+    const QList<int> expected{200, 700, 1500};
+    const QList<double> diffs = diffSignal(2000, 1.0, expected, 12.0);
+
+    QCOMPARE(drift::resolveCuts(diffs, 27.0, 15, false), QList<int>{});
+
+    double used = 0.0;
+    bool adaptive = false;
+    const QList<int> cuts = drift::resolveCuts(diffs, 27.0, 15, true, 4.0, &used, &adaptive);
+
+    QCOMPARE(cuts, expected);
+    QCOMPARE(adaptive, true);
+    QVERIFY(used < 27.0);
+    QVERIFY(used > 1.0);
+}
+
+void EngineTest::sceneCutsKeepWorkingFixedThreshold()
+{
+    // A threshold that is finding plenty must never be second-guessed, even though the
+    // adaptive one would find more: promoting noise to cuts is the worse failure.
+    QList<int> spikes;
+    for (int i = 100; i < 2000; i += 100)
+        spikes.append(i);
+    const QList<double> diffs = diffSignal(2000, 4.0, spikes, 80.0);
+
+    double used = 0.0;
+    bool adaptive = true;
+    const QList<int> cuts = drift::resolveCuts(diffs, 27.0, 15, true, 4.0, &used, &adaptive);
+
+    QCOMPARE(cuts, spikes);
+    QCOMPARE(adaptive, false);
+    QCOMPARE(used, 27.0);
+}
+
+void EngineTest::sceneCutsHandleDegenerateInput()
+{
+    QVERIFY(drift::resolveCuts({}, 27.0, 15, true).isEmpty());
+
+    // Pure noise below the threshold, and too short for the fallback to be trusted.
+    const QList<double> quiet(50, 1.0);
+    QVERIFY(drift::resolveCuts(quiet, 27.0, 15, true).isEmpty());
+
+    // A dead-flat signal has a MAD of zero; the median ratio guard must stop that from
+    // turning every sample into a cut.
+    const QList<double> flat(2000, 5.0);
+    QVERIFY(drift::resolveCuts(flat, 27.0, 15, true).isEmpty());
+
+    QCOMPARE(drift::medianOf({}), 0.0);
+    QCOMPARE(drift::medianOf({4.0}), 4.0);
+    QCOMPARE(drift::medianOf({1.0, 2.0, 3.0, 4.0}), 2.5);
+    QCOMPARE(drift::medianOf({9.0, 1.0, 5.0}), 5.0);
+}
+
+void EngineTest::sceneCutsRejectNoiseAndGrain()
+{
+    std::mt19937 rng(1234);
+
+    // A locked-off shot with sensor noise and no cuts at all. The statistics on their own
+    // would put the threshold at roughly median + 4*0.3, i.e. inside the grain; the
+    // absolute floor is what keeps this empty.
+    {
+        std::normal_distribution<double> noise(1.0, 0.3);
+        QList<double> diffs;
+        diffs.reserve(2000);
+        for (int i = 0; i < 2000; ++i)
+            diffs.append(std::abs(noise(rng)));
+
+        QVERIFY(drift::resolveCuts(diffs, 27.0, 15, true).isEmpty());
+    }
+
+    // Grainy handheld footage: every frame already differs a lot and the spread is narrow,
+    // so the derived threshold clears the absolute floor easily. The median ratio is what
+    // rejects it — without that guard most frames would register as cuts.
+    {
+        std::normal_distribution<double> grain(10.0, 0.4);
+        QList<double> diffs;
+        diffs.reserve(2000);
+        for (int i = 0; i < 2000; ++i)
+            diffs.append(grain(rng));
+
+        QVERIFY(drift::resolveCuts(diffs, 27.0, 15, true).isEmpty());
+    }
+
+    // Same grainy footage, but with genuine cuts standing well clear of it. Those must
+    // still be found by the fixed threshold, with no help from the fallback.
+    {
+        std::normal_distribution<double> grain(10.0, 0.4);
+        QList<double> diffs;
+        diffs.reserve(2000);
+        for (int i = 0; i < 2000; ++i)
+            diffs.append(grain(rng));
+        const QList<int> expected{300, 800, 1600};
+        for (int i : expected)
+            diffs[i] = 70.0;
+
+        bool adaptive = true;
+        const QList<int> cuts = drift::resolveCuts(diffs, 27.0, 15, true, 4.0, nullptr, &adaptive);
+        QCOMPARE(cuts, expected);
+        QCOMPARE(adaptive, false);
+    }
+}
+
+void EngineTest::scenesPartitionTheRange()
+{
+    constexpr drift::TimeUs kIn = 2 * drift::kUsPerSecond;
+    constexpr drift::TimeUs kOut = 12 * drift::kUsPerSecond;
+
+    // 500 samples across a 10 s range: one sample every 20 ms.
+    constexpr double kStep = 20.0 * drift::kUsPerMs;
+
+    const QList<drift::Scene> scenes = drift::scenesFromCuts({100, 250, 400}, kStep, kIn, kOut);
+    QCOMPARE(scenes.size(), 4);
+
+    // Gapless, ascending, and covering exactly the requested range.
+    QCOMPARE(scenes.first().sourceIn, kIn);
+    QCOMPARE(scenes.last().sourceOut, kOut);
+    for (int i = 0; i < scenes.size(); ++i) {
+        QVERIFY(scenes.at(i).sourceOut > scenes.at(i).sourceIn);
+        const drift::Scene &s = scenes.at(i);
+        QVERIFY(s.thumbnailUs >= s.sourceIn && s.thumbnailUs < s.sourceOut);
+        if (i > 0)
+            QCOMPARE(scenes.at(i - 1).sourceOut, s.sourceIn);
+    }
+
+    // Boundaries land exactly on the sampled instants, with no accumulated drift.
+    QCOMPARE(scenes.at(1).sourceIn, kIn + drift::TimeUs(100 * kStep));
+    QCOMPARE(scenes.at(2).sourceIn, kIn + drift::TimeUs(250 * kStep));
+    QCOMPARE(scenes.at(3).sourceIn, kIn + drift::TimeUs(400 * kStep));
+
+    // A single-shot clip is one scene, not an empty result.
+    const QList<drift::Scene> single = drift::scenesFromCuts({}, kStep, kIn, kOut);
+    QCOMPARE(single.size(), 1);
+    QCOMPARE(single.first().sourceIn, kIn);
+    QCOMPARE(single.first().sourceOut, kOut);
+
+    // Cuts outside the sampled range cannot produce empty or inverted scenes.
+    const QList<drift::Scene> clamped = drift::scenesFromCuts({0, 250, 500, 900}, kStep, kIn, kOut);
+    for (const drift::Scene &s : clamped)
+        QVERIFY(s.sourceOut > s.sourceIn);
+    QCOMPARE(clamped.first().sourceIn, kIn);
+    QCOMPARE(clamped.last().sourceOut, kOut);
+
+    // An empty or inverted range yields nothing at all.
+    QVERIFY(drift::scenesFromCuts({}, kStep, kOut, kIn).isEmpty());
+    QVERIFY(drift::scenesFromCuts({}, kStep, kIn, kIn).isEmpty());
+}
+
+void EngineTest::sceneLoudnessRanksAcrossTheClip()
+{
+    QCOMPARE(drift::percentileOf({}, 0.5), 0.0);
+    QCOMPARE(drift::percentileOf({7.0}, 0.9), 7.0);
+    QCOMPARE(drift::percentileOf({0.0, 10.0}, 0.5), 5.0);
+    QCOMPARE(drift::percentileOf({4.0, 1.0, 3.0, 2.0}, 0.0), 1.0);
+    QCOMPARE(drift::percentileOf({4.0, 1.0, 3.0, 2.0}, 1.0), 4.0);
+
+    // Ranking is monotonic in the input and spans the full range.
+    const QList<double> ranked = drift::normaliseByPercentileRange({-40.0, -6.0, -38.0, -10.0});
+    QCOMPARE(ranked.size(), 4);
+    for (double v : ranked)
+        QVERIFY(v >= 0.0 && v <= 1.0);
+    QVERIFY(ranked.at(0) < ranked.at(2)); // -40 quieter than -38
+    QVERIFY(ranked.at(2) < ranked.at(3)); // -38 quieter than -10
+    QVERIFY(ranked.at(3) < ranked.at(1)); // -10 quieter than -6
+
+    // One extreme outlier must not flatten the scenes that matter. At a realistic scene
+    // count the 90th percentile sits inside the bulk, so the outlier stops influencing the
+    // scale at all — which is the whole reason for preferring percentiles to min/max.
+    QList<double> withOutlier;
+    for (int i = 0; i < 20; ++i)
+        withOutlier.append(-30.0 + i * 0.25); // a tight cluster from -30 to -25.25
+    withOutlier.append(0.0);                  // one music sting, far above everything else
+
+    const QList<double> spread = drift::normaliseByPercentileRange(withOutlier);
+    QCOMPARE(spread.size(), 21);
+    QCOMPARE(spread.last(), 1.0);
+
+    // The cluster keeps most of the 0..1 range to discriminate within.
+    QVERIFY(spread.at(19) - spread.at(0) > 0.9);
+
+    // Min/max scaling on the same input would squeeze that cluster into a sliver.
+    const double minMaxSpread = (withOutlier.at(19) - withOutlier.at(0))
+                                / (withOutlier.last() - withOutlier.at(0));
+    QVERIFY(minMaxSpread < 0.2);
+
+    // Nothing to rank when every value is the same.
+    for (double v : drift::normaliseByPercentileRange({5.0, 5.0, 5.0, 5.0}))
+        QCOMPARE(v, 0.0);
+    QVERIFY(drift::normaliseByPercentileRange({}).isEmpty());
+
+    // Per-second loudness: one second of full-scale square wave is 0 dBFS, silence floors.
+    constexpr int kRate = 16000;
+    std::vector<float> pcm(size_t(kRate) * 3, 0.0f);
+    for (int i = 0; i < kRate; ++i)
+        pcm[size_t(kRate) + i] = (i % 2) ? 1.0f : -1.0f; // the middle second only
+
+    const QList<double> dbfs = drift::perSecondLoudness(pcm.data(), int(pcm.size()), kRate);
+    QCOMPARE(dbfs.size(), 3);
+    QCOMPARE(dbfs.at(0), drift::kSilenceDbfs);
+    QVERIFY(std::abs(dbfs.at(1)) < 0.01);
+    QCOMPARE(dbfs.at(2), drift::kSilenceDbfs);
+
+    QVERIFY(drift::perSecondLoudness(nullptr, 100, kRate).isEmpty());
+    QVERIFY(drift::perSecondLoudness(pcm.data(), 0, kRate).isEmpty());
+}
+
+void EngineTest::yoloxDecodeAppliesGridAndStride()
+{
+    // YOLOX's published export does not bake the grid decode in, so the raw cx/cy are offsets
+    // within a cell and w/h are log-scale. Verified against yolox_tiny.onnx, whose raw output
+    // spans roughly -2..2 rather than the 0..416 an already-decoded model would give.
+    constexpr int kInput = 416;
+    constexpr int kClasses = 80;
+    constexpr int kStride = 5 + kClasses;
+    // 52^2 + 26^2 + 13^2, the strides 8/16/32 grids.
+    constexpr int kAnchors = 2704 + 676 + 169;
+
+    std::vector<float> raw(size_t(kAnchors) * kStride, 0.0f);
+
+    auto put = [&](int anchor, float cx, float cy, float w, float h, float obj, int cls) {
+        float *row = raw.data() + size_t(anchor) * kStride;
+        row[0] = cx; row[1] = cy; row[2] = w; row[3] = h; row[4] = obj;
+        row[5 + cls] = 1.0f;
+    };
+
+    // Anchor 0 is grid (0,0) at stride 8; a centre offset of 0.5 lands at 4 px.
+    put(0, 0.5f, 0.5f, 0.0f, 0.0f, 0.9f, 0);
+    // Anchor 53 is grid (1,1) at stride 8 (row-major, x fastest across 52 columns).
+    put(53, 0.0f, 0.0f, 0.0f, 0.0f, 0.9f, 1);
+    // First anchor of the stride-32 grid: grid (0,0), so the centre is at 16 px.
+    put(2704 + 676, 0.5f, 0.5f, 0.0f, 0.0f, 0.9f, 2);
+
+    const QStringList names{QStringLiteral("person"), QStringLiteral("bicycle"),
+                            QStringLiteral("car")};
+    const QList<drift::Detection> dets =
+        drift::decodeYoloxOutput(raw.data(), kAnchors, kClasses, kInput, 0.3, names);
+    QCOMPARE(dets.size(), 3);
+
+    // exp(0) * stride is the box size, centred on the decoded point.
+    QCOMPARE(dets.at(0).label, QStringLiteral("person"));
+    QVERIFY(std::abs(dets.at(0).box.center().x() - 4.0) < 1e-6);
+    QVERIFY(std::abs(dets.at(0).box.center().y() - 4.0) < 1e-6);
+    QVERIFY(std::abs(dets.at(0).box.width() - 8.0) < 1e-6);
+
+    QCOMPARE(dets.at(1).label, QStringLiteral("bicycle"));
+    QVERIFY(std::abs(dets.at(1).box.center().x() - 8.0) < 1e-6);
+    QVERIFY(std::abs(dets.at(1).box.center().y() - 8.0) < 1e-6);
+
+    QCOMPARE(dets.at(2).label, QStringLiteral("car"));
+    QVERIFY(std::abs(dets.at(2).box.center().x() - 16.0) < 1e-6);
+    QVERIFY(std::abs(dets.at(2).box.width() - 32.0) < 1e-6);
+
+    // Confidence is objectness times class score, so a confident box of an unconfident class
+    // is dropped.
+    std::vector<float> weak(size_t(kAnchors) * kStride, 0.0f);
+    float *row = weak.data();
+    row[0] = 0.5f; row[1] = 0.5f; row[4] = 0.9f; row[5] = 0.2f; // 0.9 * 0.2 = 0.18
+    QVERIFY(drift::decodeYoloxOutput(weak.data(), kAnchors, kClasses, kInput, 0.3, names).isEmpty());
+
+    // Degenerate input must not read past the buffer.
+    QVERIFY(drift::decodeYoloxOutput(nullptr, kAnchors, kClasses, kInput, 0.3, names).isEmpty());
+    QVERIFY(drift::decodeYoloxOutput(raw.data(), 0, kClasses, kInput, 0.3, names).isEmpty());
+
+    // The letterbox scales to fit and pads bottom-right, so the ratio is the limiting axis.
+    QCOMPARE(drift::letterboxRatio(832, 416, 416), 0.5);
+    QCOMPARE(drift::letterboxRatio(416, 832, 416), 0.5);
+    QCOMPARE(drift::letterboxRatio(0, 100, 416), 0.0);
+}
+
+void EngineTest::objectNmsIsPerClass()
+{
+    auto make = [](double x, double y, int cls, double score) {
+        drift::Detection d;
+        d.box = QRectF(x, y, 100, 100);
+        d.classId = cls;
+        d.score = score;
+        return d;
+    };
+
+    // Two heavily overlapping boxes of the same class are one object: only the stronger stays.
+    const QList<drift::Detection> same =
+        drift::nonMaximumSuppression({make(0, 0, 0, 0.9), make(10, 10, 0, 0.7)}, 0.45);
+    QCOMPARE(same.size(), 1);
+    QCOMPARE(same.first().score, 0.9);
+
+    // The same overlap across two classes is a person in front of a car — both survive.
+    const QList<drift::Detection> different =
+        drift::nonMaximumSuppression({make(0, 0, 0, 0.9), make(10, 10, 1, 0.7)}, 0.45);
+    QCOMPARE(different.size(), 2);
+
+    // Boxes that barely touch are separate objects even within one class.
+    const QList<drift::Detection> apart =
+        drift::nonMaximumSuppression({make(0, 0, 0, 0.9), make(95, 95, 0, 0.7)}, 0.45);
+    QCOMPARE(apart.size(), 2);
+
+    QVERIFY(drift::nonMaximumSuppression({}, 0.45).isEmpty());
 }
 
 QTEST_MAIN(EngineTest)

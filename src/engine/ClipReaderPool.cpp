@@ -84,13 +84,13 @@ void ClipReaderPool::warmVideoFrames(const QList<VideoRequest> &requests)
         }
         // Prefer NV12 warm — matches the live-preview decode path.
         QMetaObject::invokeMethod(worker, "decodeVideoNv12", Qt::QueuedConnection,
-                                  Q_ARG(drift::TimeUs, request.sourceUs), Q_ARG(int, request.maxWidth),
-                                  Q_ARG(int, request.maxHeight));
+                                  Q_ARG(quint64, request.streamId), Q_ARG(drift::TimeUs, request.sourceUs),
+                                  Q_ARG(int, request.maxWidth), Q_ARG(int, request.maxHeight));
     }
 }
 
-QImage ClipReaderPool::readVideoFrame(const QString &path, drift::TimeUs sourceUs, int maxWidth,
-                                      int maxHeight)
+QImage ClipReaderPool::readVideoFrame(const QString &path, quint64 streamId, drift::TimeUs sourceUs,
+                                      int maxWidth, int maxHeight)
 {
     if (path.isEmpty())
         return {};
@@ -106,19 +106,20 @@ QImage ClipReaderPool::readVideoFrame(const QString &path, drift::TimeUs sourceU
 
     QImage frame;
     QMetaObject::invokeMethod(worker, "decodeVideo", Qt::BlockingQueuedConnection, Q_RETURN_ARG(QImage, frame),
-                              Q_ARG(drift::TimeUs, sourceUs), Q_ARG(int, maxWidth), Q_ARG(int, maxHeight));
+                              Q_ARG(quint64, streamId), Q_ARG(drift::TimeUs, sourceUs),
+                              Q_ARG(int, maxWidth), Q_ARG(int, maxHeight));
 
     // Decode one frame beyond the current position while the caller composites
     // this one. The reader knows the source frame duration; the old code guessed
     // a hardcoded 1/30 s, which missed on every clip that isn't 30 fps.
-    QMetaObject::invokeMethod(worker, "prefetchNextVideo", Qt::QueuedConnection, Q_ARG(int, maxWidth),
-                              Q_ARG(int, maxHeight));
+    QMetaObject::invokeMethod(worker, "prefetchNextVideo", Qt::QueuedConnection,
+                              Q_ARG(quint64, streamId), Q_ARG(int, maxWidth), Q_ARG(int, maxHeight));
 
     return frame;
 }
 
-Nv12Frame ClipReaderPool::readVideoFrameNv12(const QString &path, drift::TimeUs sourceUs, int maxWidth,
-                                             int maxHeight)
+Nv12Frame ClipReaderPool::readVideoFrameNv12(const QString &path, quint64 streamId,
+                                             drift::TimeUs sourceUs, int maxWidth, int maxHeight)
 {
     if (path.isEmpty())
         return {};
@@ -131,15 +132,18 @@ Nv12Frame ClipReaderPool::readVideoFrameNv12(const QString &path, drift::TimeUs 
 
     Nv12Frame frame;
     QMetaObject::invokeMethod(worker, "decodeVideoNv12", Qt::BlockingQueuedConnection,
-                              Q_RETURN_ARG(Nv12Frame, frame), Q_ARG(drift::TimeUs, sourceUs),
-                              Q_ARG(int, maxWidth), Q_ARG(int, maxHeight));
+                              Q_RETURN_ARG(Nv12Frame, frame), Q_ARG(quint64, streamId),
+                              Q_ARG(drift::TimeUs, sourceUs), Q_ARG(int, maxWidth),
+                              Q_ARG(int, maxHeight));
 
-    worker->requestPrefetchNv12(maxWidth, maxHeight, m_readAheadUs.load(std::memory_order_relaxed));
+    worker->requestPrefetchNv12(streamId, maxWidth, maxHeight,
+                                m_readAheadUs.load(std::memory_order_relaxed));
 
     return frame;
 }
 
-int ClipReaderPool::readAudioInterleaved(const QString &path, drift::TimeUs sourceStartUs, int sampleCount,
+int ClipReaderPool::readAudioInterleaved(const QString &path, quint64 streamId,
+                                         drift::TimeUs sourceStartUs, int sampleCount,
                                          int outputSampleRate, float *interleavedStereoOut)
 {
     if (path.isEmpty() || !interleavedStereoOut || sampleCount <= 0)
@@ -153,9 +157,17 @@ int ClipReaderPool::readAudioInterleaved(const QString &path, drift::TimeUs sour
 
     int written = 0;
     QMetaObject::invokeMethod(worker, "decodeAudio", Qt::BlockingQueuedConnection, Q_RETURN_ARG(int, written),
-                              Q_ARG(drift::TimeUs, sourceStartUs), Q_ARG(int, sampleCount),
-                              Q_ARG(int, outputSampleRate), Q_ARG(float *, interleavedStereoOut));
+                              Q_ARG(quint64, streamId), Q_ARG(drift::TimeUs, sourceStartUs),
+                              Q_ARG(int, sampleCount), Q_ARG(int, outputSampleRate),
+                              Q_ARG(float *, interleavedStereoOut));
     return written;
+}
+
+void ClipReaderPool::resetAudioStreams()
+{
+    QMutexLocker lock(&m_mutex);
+    for (auto &entry : m_audioWorkers)
+        entry.second->worker->requestAudioReposition();
 }
 
 void ClipReaderPool::retainActivePaths(const QSet<QString> &videoPaths, const QSet<QString> &audioPaths)

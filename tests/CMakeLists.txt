@@ -11,6 +11,11 @@ qt_add_executable(tst_editorstate
     tst_editorstate.cpp
     ../src/SegmentImageStore.cpp
     ../src/ClipPreviewImageStore.cpp
+    ../src/MulticamImageStore.cpp
+    # The provider, not just the store: the id QML addresses a tile by is parsed here, and a
+    # store test cannot see that half. Costs a Qt6::Quick link, but needs no QML engine —
+    # requestImage is called directly.
+    ../src/MulticamImageProvider.cpp
     ../src/models/AppController.cpp
     ../src/models/AssetLibrary.cpp
     ../src/models/TimelineModel.cpp
@@ -30,7 +35,7 @@ qt_add_executable(tst_editorstate
     ../src/mcp/McpStdio.cpp
 )
 target_include_directories(tst_editorstate PRIVATE ../src)
-target_link_libraries(tst_editorstate PRIVATE Qt6::Test Qt6::Gui Qt6::Multimedia Qt6::Concurrent Qt6::Network driftcore driftengine)
+target_link_libraries(tst_editorstate PRIVATE Qt6::Test Qt6::Gui Qt6::Quick Qt6::Multimedia Qt6::Concurrent Qt6::Network driftcore driftengine)
 target_compile_definitions(tst_editorstate PRIVATE
     DRIFT_TEST_DENOISE_MODEL_DIR="${CMAKE_SOURCE_DIR}/models/deepfilternet3"
     DRIFT_VERSION="${PROJECT_VERSION}")
@@ -46,6 +51,17 @@ qt_add_executable(tst_playback
 target_include_directories(tst_playback PRIVATE ../src)
 target_link_libraries(tst_playback PRIVATE Qt6::Test Qt6::Multimedia driftcore)
 add_test(NAME Playback COMMAND tst_playback)
+
+qt_add_executable(tst_layoutstore tst_layoutstore.cpp ../src/models/LayoutStore.cpp)
+target_include_directories(tst_layoutstore PRIVATE ../src)
+# Qt6::Gui for QScreen: restoring a window means checking it against the displays
+# that are actually attached now.
+target_link_libraries(tst_layoutstore PRIVATE Qt6::Test Qt6::Gui)
+add_test(NAME LayoutStore COMMAND tst_layoutstore)
+# Screen-dependent assertions, and saveWindowState deliberately drops the window
+# position under Wayland (the compositor owns it there). Pin the platform so the
+# test means the same thing on a dev machine as it does headless in CI.
+set_tests_properties(LayoutStore PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 qt_add_executable(tst_addonpackage tst_addonpackage.cpp)
 target_include_directories(tst_addonpackage PRIVATE ../src)
@@ -72,6 +88,7 @@ target_compile_definitions(tst_engine PRIVATE
     DRIFT_TEST_FONTS_DIR="${CMAKE_SOURCE_DIR}/fonts"
     DRIFT_TEST_EMOJI_FONT_DIR="${CMAKE_SOURCE_DIR}/emoji-fonts"
     DRIFT_TEST_AUDIO_EFFECTS_DIR="${CMAKE_SOURCE_DIR}/audio-effects"
+    DRIFT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
     # Not committed (models/ is gitignored). The denoise tests skip when it is absent so a
     # checkout without the model still passes.
     DRIFT_TEST_DENOISE_MODEL_DIR="${CMAKE_SOURCE_DIR}/models/deepfilternet3"
@@ -88,6 +105,7 @@ qt_add_executable(tst_mcp
     ../src/mcp/McpHttp.cpp
     ../src/SegmentImageStore.cpp
     ../src/ClipPreviewImageStore.cpp
+    ../src/MulticamImageStore.cpp
     ../src/models/AppController.cpp
     ../src/models/AssetLibrary.cpp
     ../src/models/TimelineModel.cpp
